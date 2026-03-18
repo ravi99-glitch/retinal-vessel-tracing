@@ -23,14 +23,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from baselines.frangi_baseline import FrangiBaseline
 from data.dataloader import RetinalFundusDataset
 from data.dataloader import load_dataset
+from data.dataset_paths import get_root, OUTPUT_DIR as _OUTPUT_BASE
 from evaluation.metrics import CenterlineMetrics
 
 # ==========================================
 # CONFIG — change these to switch dataset
 # ==========================================
 DATASET_NAME = "DRIVE"
-DATA_ROOT    = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/data/DRIVE/training"
-OUTPUT_DIR   = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/scripts/frangi"
+DATA_ROOT    = str(get_root(DATASET_NAME))
+OUTPUT_DIR   = str(_OUTPUT_BASE / "frangi")
 
 # ==========================================
 # MAIN
@@ -56,7 +57,7 @@ if __name__ == "__main__":
         image_id = sample["id"]
 
         # Run Frangi baseline
-        pred_skeleton, vesselness = model.extract_centerline(
+        pred_skeleton, vesselness, _ = model.extract_centerline(
             sample["image"],
             return_vesselness=True,
             external_fov_mask=sample["fov_mask"],

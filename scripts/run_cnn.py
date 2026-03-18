@@ -33,21 +33,22 @@ from baselines.centerline_unet_baseline import (
     CenterlineUNet, CenterlineLoss, CenterlinePredictor,
 )
 from data.dataloader import load_dataset
+from data.dataset_paths import get_root, WEIGHTS_DIR, OUTPUT_DIR as _OUTPUT_BASE
 from evaluation.metrics import CenterlineMetrics
 
 # ==========================================
 # CONFIG
 # ==========================================
 DATASET_NAME = "DRIVE"
-DATA_ROOT    = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/data/DRIVE/training"
-SAVE_PATH    = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/scripts/centerline_unet.pt"
-OUTPUT_DIR   = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/scripts/cnn_training"
+DATA_ROOT    = str(get_root(DATASET_NAME))
+SAVE_PATH    = str(WEIGHTS_DIR / "centerline_unet.pt")
+OUTPUT_DIR   = str(_OUTPUT_BASE / "unet")
 
-EPOCHS       = 100
+EPOCHS       = 10
 BATCH_SIZE   = 2
 LR           = 1e-3
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_CFG    = dict(in_channels=1, base_ch=16, depth=4)
+MODEL_CFG    = dict(in_channels=1, base_ch=16)
 
 # For DRIVE (has official test dir): controls train/val split only.
 # For STARE etc.: controls full train/val/test split.

@@ -23,14 +23,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from baselines.greedy_tracer_baseline import GreedyTracerBaseline
 from data.dataloader import RetinalFundusDataset
 from data.dataloader import load_dataset
+from data.dataset_paths import get_root, OUTPUT_DIR as _OUTPUT_BASE
 from evaluation.metrics import CenterlineMetrics
 
 # ==========================================
 # CONFIG — change these to switch dataset
 # ==========================================
 DATASET_NAME = "DRIVE"
-DATA_ROOT    = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/data/DRIVE/training"
-OUTPUT_DIR   = "/cfs/earth/scratch/fankhni3/retinal-vessel-tracing-2/scripts/greedy_tracer"
+DATA_ROOT    = str(get_root(DATASET_NAME))
+OUTPUT_DIR   = str(_OUTPUT_BASE / "greedy_tracer")
 
 MODEL_CFG = dict(
     sigma_min    = 0.5,
