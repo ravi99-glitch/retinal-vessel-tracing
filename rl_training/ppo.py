@@ -99,7 +99,7 @@ def evaluate(model: nn.Module,
             env.set_data(
                 image=sample['image'],
                 centerline=sample['centerline'],
-                distance_transform=sample['dist_transform'],
+                distance_transform=sample['distance_transform'],
                 fov_mask=sample['fov_mask'],
             )
 
@@ -276,7 +276,7 @@ class PPOTrainer:
         Full PPO training loop.
 
         Args:
-            train_samples:   list of sample dicts (image, centerline, dist_transform, fov_mask)
+            train_samples:   list of sample dicts (image, centerline, distance_transform, fov_mask)
             val_samples:     list of sample dicts for periodic evaluation
             save_path:       where to save best checkpoint
             log_path:        where to write training log
@@ -297,7 +297,7 @@ class PPOTrainer:
         # Initial episode
         current = np.random.choice(train_samples)
         env.set_data(image=current['image'], centerline=current['centerline'],
-                     distance_transform=current['dist_transform'], fov_mask=current['fov_mask'])
+                     distance_transform=current['distance_transform'], fov_mask=current['fov_mask'])
         obs, _    = env.reset()
         ep_reward = 0.0
         ep_length = 0
@@ -332,7 +332,7 @@ class PPOTrainer:
                     ep_length = 0
                     current = np.random.choice(train_samples)
                     env.set_data(image=current['image'], centerline=current['centerline'],
-                                 distance_transform=current['dist_transform'],
+                                 distance_transform=current['distance_transform'],
                                  fov_mask=current['fov_mask'])
                     obs, _ = env.reset()
 

@@ -48,7 +48,7 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
     5 geometric transforms + 4 brightness/contrast jitters = 9 variants.
 
     Args:
-        sample: dict with keys image, centerline, dist_transform, fov_mask, expert_traces
+        sample: dict with keys image, centerline, distance_transform, fov_mask, expert_traces
         tolerance: centerline tolerance for recomputing distance transform
 
     Returns:
@@ -66,7 +66,7 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
         return {
             'image':          new_img,
             'centerline':     new_cl,
-            'dist_transform': new_dt,
+            'distance_transform': new_dt,
             'fov_mask':       new_fov,
             'expert_traces':  new_traces,
         }
@@ -104,7 +104,7 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
     ))
 
     # Brightness / contrast jitter — geometry unchanged, no dt recompute needed
-    dt = sample['dist_transform']
+    dt = sample['distance_transform']
     for brightness, contrast in [(0.8, 1.0), (1.2, 1.0), (1.0, 0.8), (1.0, 1.2)]:
         img_jit = np.clip(
             img * contrast + (brightness - 1.0) * 0.5, 0.0, 1.0
@@ -112,7 +112,7 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
         aug.append({
             'image':          img_jit,
             'centerline':     cl,
-            'dist_transform': dt,
+            'distance_transform': dt,
             'fov_mask':       fov,
             'expert_traces':  traces,
         })
@@ -135,7 +135,7 @@ def generate_expert_pairs(sample: Dict, config: dict,
     Walk expert traces and return (observation, action) pairs.
 
     Args:
-        sample: dict with image, dist_transform, expert_traces
+        sample: dict with image, distance_transform, expert_traces
         config: full CONFIG dict (for ObservationBuilder)
         obs_size: observation patch size (e.g. 65)
 
@@ -145,7 +145,7 @@ def generate_expert_pairs(sample: Dict, config: dict,
     from rl_environment.observation import ObservationBuilder
 
     obs_builder  = ObservationBuilder(config)
-    image, dt    = sample['image'], sample['dist_transform']
+    image, dt    = sample['image'], sample['distance_transform']
     h, w         = image.shape[:2]
     half         = obs_size // 2
     visited_mask = np.zeros((h, w), dtype=np.float32)
