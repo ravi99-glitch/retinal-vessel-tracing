@@ -118,7 +118,7 @@ class FrontierTracer:
         self.env.set_data(
             image=sample['image'],
             centerline=sample['centerline'],
-            distance_transform=sample['dist_transform'],
+            distance_transform=sample['distance_transform'],
             fov_mask=sample['fov_mask'],
         )
 
