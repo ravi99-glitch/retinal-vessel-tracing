@@ -1,17 +1,16 @@
-# data/dataloader.py
 """
 Unified dataloader for retinal fundus image datasets.
 
 Supported datasets
 ------------------
-DRIVE, STARE, CHASEDB1, HRF, DRHAGIS, FIVES, LES_AV, AV_WIDE, IOSTAR
+DRIVE, STARE, CHASE_DB1, HRF, DR_HAGIS, FIVES, LES_AV, AV_WIDE, IOSTAR
 
 Supported target models
 -----------------------
-unet           - (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
-frangi         - (H,W,3) raw RGB uint8 + binary annotations (numpy)
-greedy_tracer  - same as frangi
-rl_agent       - (3,H,W) float32 RGB + centerline, distance transform, …
+unet           – (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
+frangi         – (H,W,3) raw RGB uint8 + binary annotations (numpy)
+greedy_tracer  – same as frangi
+rl_agent       – (3,H,W) float32 RGB + centerline, distance transform, …
 
 Split logic
 -----------
@@ -20,8 +19,10 @@ use that directory when ``split="test"`` is requested.  ``split="train"``
 and ``split="val"`` partition the training directory only.
 
 If the official test directory exists but contains no annotated samples
-(missing ground-truth files), the loader falls back to a ratio-based
-split from the training directory with a warning.
+(missing ground-truth files — as is the case for DRIVE/test which has
+images and FOV masks but **no** manual vessel segmentations), the loader
+falls back to a ratio-based split from the training directory with a
+warning.
 
 Datasets without an official test directory (e.g. STARE) use a 3-way
 ratio-based split over all discovered samples.
@@ -47,7 +48,8 @@ Usage
                               target="unet", split="train",
                               batch_size=2, shuffle=True)
 
-    # Test split — automatically loaded from data/DRIVE/test/
+    # Test split — DRIVE has no GT in test/, so this falls back
+    # to a ratio-based split from training/
     test_ds, test_loader = load_dataset("data/DRIVE", "DRIVE",
                                         target="unet", split="test",
                                         batch_size=1)
@@ -112,6 +114,8 @@ class DatasetConfig:
     test_subdir   : sub-directory under the dataset root that contains
                     an official test set.  ``None`` means no official
                     test directory — a ratio-based split is used instead.
+                    NOTE: the test directory may lack vessel annotations
+                    (e.g. DRIVE/test has images + FOV masks only).
 
     Note — flat-directory datasets
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -120,9 +124,9 @@ class DatasetConfig:
     These are automatically filtered out because their stems do not
     produce a valid vessel filename (the double-suffix trick).
 
-    Example: STARE has ``im0001.ppm`` and ``im0001.ah.ppm`` side by
-    side.  ``im0001.ah.ppm`` has stem ``im0001.ah``; the expected
-    vessel file ``im0001.ah.ah.ppm`` does not exist → skipped.
+    Example: STARE has ``im0001.ppm`` and ``im0001.vk.ppm`` side by
+    side.  ``im0001.vk.ppm`` has stem ``im0001.vk``; the expected
+    vessel file ``im0001.vk.vk.ppm`` does not exist → skipped.
     """
 
     image_dir: str
@@ -164,6 +168,10 @@ class DatasetConfig:
 # Pre-defined dataset registry
 # ---------------------------------------------------------------------------
 
+# DRIVE — training/ has 1st_manual annotations; test/ has images + FOV
+# masks only (no vessel ground truth).  Requesting split="test" will
+# detect the missing annotations and fall back to a ratio-based split
+# from training/.
 _DRIVE_CFG = DatasetConfig(
     image_dir="images",
     vessel_dir="1st_manual",
@@ -176,24 +184,24 @@ _DRIVE_CFG = DatasetConfig(
     test_subdir="test",
 )
 
+# STARE — flat directory: im0001.ppm (image), im0001.vk.ppm (annotation)
 _STARE_CFG = DatasetConfig(
-    # Flat directory: im0001.ppm (image) and im0001.ah.ppm (annotation)
-    # live side-by-side.  Annotations auto-filtered by double-suffix.
     image_dir=".",
     vessel_dir=".",
     image_glob="*.ppm",
-    vessel_suffix=".ah.ppm",
+    vessel_suffix=".vk.ppm",
 )
 
+# CHASEDB1 — flat directory: Image_01L.png (fundus),
+# Image_01L_1stHO.png / Image_01L_2ndHO.png (vessel annotations)
 _CHASEDB1_CFG = DatasetConfig(
-    # Flat directory: Image_01L.png (fundus), Image_01L_1stHO.png (vessel),
-    # Image_01L_2ndHO.png (2nd annotator).  Auto-filtered by double-suffix.
     image_dir=".",
     vessel_dir=".",
     image_glob="*.png",
     vessel_suffix="_1stHO.png",
 )
 
+# HRF — images/*.jpg, manual1/*.tif, mask/*.tif
 _HRF_CFG = DatasetConfig(
     image_dir="images",
     vessel_dir="manual1",
@@ -203,6 +211,8 @@ _HRF_CFG = DatasetConfig(
     mask_suffix="_mask.tif",
 )
 
+# DRHAGIS — Fundus_Images/*.jpg, Manual_Segmentations/*.png,
+# Mask_images/*.png
 _DRHAGIS_CFG = DatasetConfig(
     image_dir="Fundus_Images",
     vessel_dir="Manual_Segmentations",
@@ -212,6 +222,7 @@ _DRHAGIS_CFG = DatasetConfig(
     mask_suffix=".png",
 )
 
+# FIVES — train/ and test/ each with Original/*.png, Ground truth/*.png
 _FIVES_CFG = DatasetConfig(
     image_dir="Original",
     vessel_dir="Ground truth",
@@ -221,6 +232,7 @@ _FIVES_CFG = DatasetConfig(
     test_subdir="test",
 )
 
+# LES-AV — images/*.png, vessel-segmentations/*.png, mask/*.gif
 _LES_AV_CFG = DatasetConfig(
     image_dir="images",
     vessel_dir="vessel-segmentations",
@@ -230,6 +242,7 @@ _LES_AV_CFG = DatasetConfig(
     mask_suffix=".gif",
 )
 
+# AV-WIDE — images/*.png, manual/*.png
 _AV_WIDE_CFG = DatasetConfig(
     image_dir="images",
     vessel_dir="manual",
@@ -237,6 +250,7 @@ _AV_WIDE_CFG = DatasetConfig(
     vessel_suffix="_vessels.png",
 )
 
+# IOSTAR — image/*.jpg, GT/*.tif
 _IOSTAR_CFG = DatasetConfig(
     image_dir="image",
     vessel_dir="GT",
@@ -476,7 +490,6 @@ class RetinalFundusDataset(Dataset):
     ) -> Tuple[Path, List[Dict[str, Any]]]:
         """Try official test directory; fall back to ratio split."""
         if self._test_root is not None and self._test_root.is_dir():
-            original_root = self.root
             self.root = self._test_root
             samples = self._discover_samples()
 
@@ -754,10 +767,23 @@ class RetinalFundusDataset(Dataset):
     ) -> Dict[str, Any]:
         """RL agent format.
 
-        Returns normalised RGB tensor and all annotation channels needed
-        by :class:`environment.vessel_env.VesselTracingEnv`.
+        Returns normalised RGB tensor (with CLAHE-enhanced green channel)
+        and all annotation channels needed by
+        :class:`rl_environment.vessel_env.VesselTracingEnv`.
+
+        Also returns ``image_orig`` — the normalised RGB *before* green-
+        channel enhancement — for visualisation overlays.
         """
         img_f = rgb.astype(np.float32) / 255.0
+
+        # Save original RGB before green-channel enhancement
+        img_orig = img_f.copy()
+
+        # Enhance green channel with CLAHE for better vessel contrast
+        ext_mask = fov if fov.max() > 0 else None
+        enhanced_green = self.preprocessor.preprocess(rgb, external_mask=ext_mask)
+        img_f[:, :, 1] = enhanced_green
+
         cl = self._get_centerline(sid, vessel)
         dt = self.cl_extractor.compute_distance_transform(cl, self.tolerance)
         fov_f = (fov > 0).astype(np.float32)
@@ -765,6 +791,7 @@ class RetinalFundusDataset(Dataset):
         return {
             "id": sid,
             "image": torch.from_numpy(img_f).permute(2, 0, 1).float(),
+            "image_orig": torch.from_numpy(img_orig).permute(2, 0, 1).float(),
             "vessel_mask": torch.from_numpy(vessel).unsqueeze(0).float(),
             "centerline": torch.from_numpy(cl).unsqueeze(0).float(),
             "fov_mask": torch.from_numpy(fov_f).unsqueeze(0).float(),

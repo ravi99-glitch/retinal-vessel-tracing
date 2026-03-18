@@ -22,10 +22,18 @@ class CenterlineExtractor:
         
     def extract_centerline(self, vessel_mask: np.ndarray) -> np.ndarray:
         """Extract centerline from binary vessel mask using skeletonization."""
+        # Ensure binary mask
         binary = vessel_mask > 0.5
+
+        # Remove small disconnected components
         binary = remove_small_objects(binary, min_size=50)
+
+        # Skeletonize
         skeleton = skeletonize(binary)
+
+        # Prune spurious branches
         skeleton = self._prune_skeleton(skeleton)
+
         return skeleton.astype(np.float32)
     
     def _prune_skeleton(self, skeleton: np.ndarray) -> np.ndarray:
@@ -39,7 +47,7 @@ class CenterlineExtractor:
         return skeleton
     
     def _find_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
-        """Find endpoints (pixels with exactly one neighbor)."""
+        """Find endpoints (pixels with only one neighbor)."""
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
         neighbor_count = ndimage.convolve(skeleton.astype(int), kernel, mode='constant')
         endpoints = np.argwhere((skeleton > 0) & (neighbor_count == 1))
@@ -63,12 +71,13 @@ class CenterlineExtractor:
         for _ in range(max_steps):
             visited[y, x] = True
             length += 1
+            # Find unvisited neighbors on skeleton
             neighbors = self._get_skeleton_neighbors(skeleton, y, x, visited)
-            
+
             if len(neighbors) == 0:
-                break
+                break  # Dead end
             elif len(neighbors) > 1:
-                break
+                break  # Junction reached
             else:
                 y, x = neighbors[0]
                 
@@ -113,17 +122,22 @@ class CenterlineExtractor:
         """Convert skeleton image to graph representation."""
         G = nx.Graph()
         
+        # Find special points
         endpoints = self._find_endpoints(skeleton)
         junctions = self._find_junctions(skeleton)
         special_points = set(endpoints + junctions)
-        
+
+        # Add nodes
         for idx, point in enumerate(special_points):
-            G.add_node(idx, pos=point, 
+            G.add_node(idx, pos=point,
                       type='endpoint' if point in endpoints else 'junction')
-        
+
+        # Create mapping from coordinates to node indices
         point_to_node = {point: idx for idx, point in enumerate(special_points)}
+
+        # Trace edges between special points
         visited_edges = set()
-        
+
         for start_point in special_points:
             neighbors = self._get_skeleton_neighbors(
                 skeleton, start_point[0], start_point[1], 
@@ -177,10 +191,11 @@ class CenterlineExtractor:
                 path.append(current)
                 visited.add(current)
             else:
+                # Multiple paths - this shouldn't happen on a proper skeleton
                 current = neighbors[0]
                 path.append(current)
                 visited.add(current)
-                
+
         return path
     
     def compute_distance_transform(self, centerline: np.ndarray, 
@@ -203,15 +218,18 @@ class CenterlineExtractor:
             
         traces = []
         visited_edges = set()
-        
+
+        # Start from endpoints (degree 1 nodes)
         endpoints = [n for n in graph.nodes if graph.degree(n) == 1]
-        
+
         if not endpoints:
+            # No endpoints, start from any node
             endpoints = [list(graph.nodes)[0]]
-        
+
         for start_node in endpoints:
+            # DFS traversal from this endpoint
             stack = [(start_node, None)]
-            
+
             while stack:
                 current_node, prev_edge = stack.pop()
                 
