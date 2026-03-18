@@ -23,65 +23,11 @@ Extras:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from skimage.morphology import skeletonize
 import numpy as np
 from typing import Optional, Tuple, List
 
-from skan import Skeleton as SkanSkeleton, summarize
-
-
-# ==========================================
-# Building blocks
-# ==========================================
-
-class DSConvBlock(nn.Module):
-    """Depthwise-Separable Conv → BN → ReLU (x2)."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            # first DS conv
-            nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),
-            nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            # second DS conv
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
-            nn.Conv2d(out_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class DownBlock(nn.Module):
-    """MaxPool → DSConvBlock."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.conv = DSConvBlock(in_ch, out_ch)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.pool(x))
-
-
-class UpBlock(nn.Module):
-    """Bilinear upsample → cat skip → DSConvBlock."""
-
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv = DSConvBlock(in_ch + skip_ch, out_ch)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
-        # handle odd spatial dims
-        if x.shape != skip.shape:
-            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
-        return self.conv(torch.cat([x, skip], dim=1))
+from baselines.unet_blocks import DSConvBlock, DownBlock, UpBlock
+from baselines.greedy_tracer_baseline import GreedyTracer
 
 
 # ==========================================
@@ -96,7 +42,6 @@ class CenterlineUNet(nn.Module):
     Output: (B, 1, H, W)            - sigmoid probability map
 
     Default channel widths keep the model ~0.5 M parameters.
-    Only depth=4 is supported.
 
     Channel layout (base_ch=16):
         enc0 →  16   enc1 →  32   enc2 →  64   enc3 → 128
@@ -294,183 +239,6 @@ class CenterlineLoss(nn.Module):
         }
 
 
-# ==========================================
-# Greedy Tracer: Probability Map → Binary Skeleton
-# ==========================================
-
-class GreedyTracer:
-    """
-    Converts a soft centerline probability map into a binary skeleton
-    via greedy traversal from seed points.
-
-    Algorithm:
-      1. Threshold map at `seed_thresh` to find candidate seeds.
-      2. Non-max suppress (keep local maxima in 3x3 neighbourhood).
-      3. For each unvisited seed (highest prob first):
-         a. Follow the steepest-ascent neighbour if prob > `step_thresh`.
-         b. Trace until the path revisits a visited pixel or falls below threshold.
-      4. Optionally post-process with morphological thinning.
-
-    Args:
-        seed_thresh  : minimum probability to start a trace
-        step_thresh  : minimum probability to continue stepping
-        min_length   : discard traces shorter than this (pixels)
-        thin_output  : apply skimage skeletonize to the binary output
-    """
-
-    def __init__(
-        self,
-        seed_thresh: float = 0.5,
-        step_thresh: float = 0.3,
-        min_length: int = 5,
-        thin_output: bool = True,
-    ):
-        self.seed_thresh = seed_thresh
-        self.step_thresh = step_thresh
-        self.min_length = min_length
-        self.thin_output = thin_output
-
-        # 8-connected neighbour offsets
-        self._offsets = [
-            (-1, -1), (-1, 0), (-1, 1),
-            (0,  -1),           (0,  1),
-            (1,  -1),  (1, 0),  (1,  1),
-        ]
-
-    def _local_maxima(self, prob: np.ndarray) -> np.ndarray:
-        """Return boolean mask of strict 8-neighbour local maxima."""
-        padded = np.pad(prob, 1, mode='constant', constant_values=0)
-        lm = np.ones_like(prob, dtype=bool)
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                if dy == 0 and dx == 0:
-                    continue
-                shifted = padded[1 + dy:1 + dy + prob.shape[0],
-                                 1 + dx:1 + dx + prob.shape[1]]
-                lm &= prob >= shifted
-        return lm
-
-    def _trace_from(
-        self,
-        prob: np.ndarray,
-        visited: np.ndarray,
-        start_r: int,
-        start_c: int,
-    ) -> List[Tuple[int, int]]:
-        """Greedy steepest-ascent trace. Returns list of (r, c) pixel coords."""
-        H, W = prob.shape
-        path = [(start_r, start_c)]
-        visited[start_r, start_c] = True
-
-        r, c = start_r, start_c
-        while True:
-            best_val = self.step_thresh
-            best_rc = None
-            for dr, dc in self._offsets:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < H and 0 <= nc < W and not visited[nr, nc]:
-                    if prob[nr, nc] > best_val:
-                        best_val = prob[nr, nc]
-                        best_rc = (nr, nc)
-            if best_rc is None:
-                break
-            r, c = best_rc
-            visited[r, c] = True
-            path.append((r, c))
-
-        return path
-
-    def trace(
-        self,
-        prob_map: np.ndarray,
-        fov_mask: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """
-        Args:
-            prob_map : (H, W) float32 probability map
-            fov_mask : (H, W) uint8/bool - trace only inside mask
-
-        Returns:
-            skeleton : (H, W) uint8 binary centerline image
-        """
-        prob = prob_map.copy().astype(np.float32)
-        if fov_mask is not None:
-            prob[fov_mask == 0] = 0.0
-
-        H, W = prob.shape
-        skeleton = np.zeros((H, W), dtype=np.uint8)
-        visited  = np.zeros((H, W), dtype=bool)
-
-        # Candidate seeds: above threshold AND local maxima
-        candidates  = (prob >= self.seed_thresh) & self._local_maxima(prob)
-        seed_coords = np.argwhere(candidates)
-
-        # Sort seeds by descending probability (greedy: start from strongest)
-        seed_probs  = prob[seed_coords[:, 0], seed_coords[:, 1]]
-        order       = np.argsort(-seed_probs)
-        seed_coords = seed_coords[order]
-
-        for sr, sc in seed_coords:
-            if visited[sr, sc]:
-                continue
-            path = self._trace_from(prob, visited, sr, sc)
-            if len(path) >= self.min_length:
-                for r, c in path:
-                    skeleton[r, c] = 255
-
-        if self.thin_output and skeleton.any():
-            skeleton_bool = skeletonize(skeleton > 0)
-
-            try:
-                skel  = SkanSkeleton(skeleton_bool)
-                stats = summarize(skel, separator='_')
-
-                # Prune short tip-to-junction branches (type 1)
-                short_tips = stats[
-                    (stats['branch-type'] == 1) &
-                    (stats['branch-distance'] < self.min_length)
-                ]
-
-                pruned = skeleton_bool.copy()
-                for edge_idx in short_tips.index:
-                    coords = skel.path_coordinates(edge_idx)
-                    for r, c in coords.astype(int):
-                        pruned[r, c] = False
-
-                # Re-skeletonize to ensure perfect 1-pixel junctions
-                skeleton_bool = skeletonize(pruned)
-            except Exception:
-                pass  # Fallback if graph is too small
-
-            skeleton = (skeleton_bool * 255).astype(np.uint8)
-
-        return skeleton
-
-    def trace_batch(
-        self,
-        prob_maps: np.ndarray,
-        fov_masks: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """
-        Args:
-            prob_maps : (B, H, W) or (B, 1, H, W)
-            fov_masks : (B, H, W) or (B, 1, H, W), optional
-
-        Returns:
-            skeletons : (B, H, W) uint8
-        """
-        if prob_maps.ndim == 4:
-            prob_maps = prob_maps[:, 0]
-        if fov_masks is not None and fov_masks.ndim == 4:
-            fov_masks = fov_masks[:, 0]
-
-        B = prob_maps.shape[0]
-        results = []
-        for i in range(B):
-            m = fov_masks[i] if fov_masks is not None else None
-            results.append(self.trace(prob_maps[i], m))
-        return np.stack(results, axis=0)
-
 
 # ==========================================
 # FULL PIPELINE
@@ -561,7 +329,7 @@ class CenterlinePredictor:
             prob = self._infer_full(img_t)
 
         prob_np  = prob.numpy()
-        skeleton = self.tracer.trace(prob_np, fov_mask)
+        skeleton, _ = self.tracer.trace(prob_np, fov_mask)
         return prob_np, skeleton
 
 
@@ -596,7 +364,7 @@ if __name__ == '__main__':
     # ── Greedy Tracer ──
     tracer   = GreedyTracer(seed_thresh=0.5, step_thresh=0.3, min_length=5)
     prob_np  = pred[0, 0].detach().cpu().numpy()
-    skeleton = tracer.trace(prob_np)
+    skeleton, _ = tracer.trace(prob_np)
     print(f"Skeleton   : {skeleton.shape}, nonzero pixels: {skeleton.sum() // 255}")
 
     print("=== All OK ===")
