@@ -54,6 +54,17 @@ MODEL_CFG    = dict(in_channels=1, base_ch=16)
 # For STARE etc.: controls full train/val/test split.
 SPLIT_RATIOS = (0.7, 0.15, 0.15)
 
+# Standardised metric columns — shared across all baseline scripts
+METRIC_COLS = [
+    "iou",
+    "clDice",
+    "betti_0_error",
+    "hd95",
+    "f1@1px",    "precision@1px", "recall@1px",
+    "f1@2px",    "precision@2px", "recall@2px",
+    "f1@3px",    "precision@3px", "recall@3px",
+]
+
 # ==========================================
 # AUGMENTATION
 # ==========================================
@@ -132,8 +143,9 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
             checkpoint_path, device=DEVICE,
         )
 
-    metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
-    all_metrics, mosaic_data = [], []
+    metrics_fn  = CenterlineMetrics(tolerance_levels=[1, 2, 3])
+    all_metrics = []
+    mosaic_data = []
 
     for batch in tqdm(loader, desc=f"Evaluating ({split_label})"):
         img_np      = batch['image'][0, 0].numpy()
@@ -143,7 +155,18 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
         image_id    = batch['id'][0]
 
         prob_map, pred_skel = predictor.predict(img_np, fov_mask=mask_np)
-        res = metrics_fn.compute_all_metrics(pred_skel, gt_skel, vessel_mask)
+
+        # Threshold prob map → binary vessel mask for IoU + clDice
+        pred_vessel_mask = (prob_map >= 0.5).astype(np.uint8) * 255
+
+        res = metrics_fn.compute_all_metrics(
+            pred_skeleton    = pred_skel,
+            gt_skeleton      = gt_skel,
+            pred_vessel_mask = pred_vessel_mask,
+            gt_vessel_mask   = vessel_mask,
+            pred_prob        = prob_map,
+            fov_mask         = mask_np,
+        )
         res['image_id'] = image_id
         all_metrics.append(res)
 
@@ -165,7 +188,9 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
         overlay = np.zeros((*img_np.shape[:2], 3), dtype=np.uint8)
         overlay[..., 1] = gt_vis; overlay[..., 0] = pred_vis
         axes[3].imshow(overlay)
-        axes[3].set_title(f"F1@2px: {res.get('f1@2px', 0):.3f}")
+        axes[3].set_title(
+            f"F1@2px: {res.get('f1@2px', 0):.3f} | IoU: {res.get('iou', 0):.3f}"
+        )
         for ax in axes: ax.axis('off')
         plt.tight_layout()
         plt.savefig(os.path.join(panels_dir, f"{image_id}_panel.png"), dpi=150)
@@ -173,7 +198,7 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
 
     # Mosaic
     if mosaic_data:
-        n = len(mosaic_data)
+        n      = len(mosaic_data)
         n_cols = min(n, 4)
         n_rows = int(np.ceil(n / n_cols))
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*5, n_rows*5))
@@ -184,7 +209,9 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
             ov[..., 1] = d['gt_skeleton']; ov[..., 0] = d['pred_skeleton']
             axes[i].imshow(ov)
             axes[i].set_title(
-                f"{d['image_id']}\nF1@2px: {d['metrics'].get('f1@2px',0):.3f}",
+                f"{d['image_id']}\n"
+                f"F1@2px: {d['metrics'].get('f1@2px', 0):.3f} | "
+                f"IoU: {d['metrics'].get('iou', 0):.3f}",
                 fontweight='bold',
             )
             axes[i].axis('off')
@@ -193,18 +220,23 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
         plt.savefig(os.path.join(OUTPUT_DIR, f"mosaic_{split_label.lower()}.png"), dpi=200)
         plt.close()
 
-    # Summary table
+    # Summary table + CSV
     df = pd.DataFrame(all_metrics)
-    rows = [
+    summary_rows = [
         {"Metric": c, "Mean +/- Std": f"{df[c].mean():.4f} +/- {df[c].std():.4f}"}
-        for c in ["clDice", "hd95", "f1@1px", "f1@2px", "f1@3px"]
-        if c in df.columns
+        for c in METRIC_COLS if c in df.columns
     ]
+    summary_df = pd.DataFrame(summary_rows)
+
     print("\n" + "="*50)
     print(f"   FINAL RESULTS — {DATASET_NAME} ({split_label})")
     print("="*50)
-    print(pd.DataFrame(rows).to_string(index=False))
+    print(summary_df.to_string(index=False))
     print("="*50)
+
+    df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+    summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
+    print(f"CSVs saved → {OUTPUT_DIR}")
 
 # ==========================================
 # MAIN
@@ -212,10 +244,6 @@ def evaluate_and_visualize(checkpoint_path, test_dataset, split_label="Test"):
 if __name__ == "__main__":
     RUN_TRAINING = True
 
-    # ── All 3 splits created via load_dataset ────────────
-    # The dataloader handles the split logic:
-    #   DRIVE  → train/val from training/, test from test/
-    #   STARE  → train/val/test via ratio-based split
     common = dict(
         target="unet",
         split_ratios=SPLIT_RATIOS,
@@ -242,7 +270,6 @@ if __name__ == "__main__":
     print(f"[{DATASET_NAME}]  train={len(train_ds)}  "
           f"val={len(val_ds)}  test={len(test_ds)}")
 
-    # ── Training + validation ────────────────────────────
     if RUN_TRAINING:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -284,6 +311,5 @@ if __name__ == "__main__":
         )
         print(f"Best val loss: {best_val_loss:.4f}")
 
-    # ── Final evaluation on HELD-OUT test set ────────────
     if os.path.exists(SAVE_PATH):
         evaluate_and_visualize(SAVE_PATH, test_ds, split_label="Test")
