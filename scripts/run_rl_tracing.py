@@ -1,5 +1,6 @@
-# scripts/drive_rl_tracing.py
 """
+scripts/drive_rl_tracing.py
+=========================
 End-to-end inference: SeedDetector → FrontierTracer → F1 evaluation.
 """
 
@@ -49,15 +50,9 @@ MIN_COV_GAIN    = 0.001
 TEST_IDS = ["38_training", "39_training", "40_training"]
 
 # Morphological post-processing params
-# Dilation radius: bridges gaps between nearby path endpoints.
-# 3px is conservative — increase to 5 if vessel gaps are wider.
 DILATION_RADIUS = 3
 
 # FOV-ring peripheral seeding params
-# Adds evenly-spaced seeds just inside the FOV boundary to catch
-# thin peripheral vessels the seed detector misses (low contrast -> low confidence).
-# N_RING_SEEDS  : number of angular positions around the FOV ring (24 = every 15 degrees)
-# RING_INSET_PX : how far inside the FOV boundary to place seeds (avoids edge artifacts)
 N_RING_SEEDS  = 24
 RING_INSET_PX = 40
 
@@ -68,16 +63,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ==========================================
 metrics_calc = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
-CSV_COLUMNS = [
-    'image_id',
-    'precision@1px', 'recall@1px', 'f1@1px',
-    'precision@2px', 'recall@2px', 'f1@2px',
-    'precision@3px', 'recall@3px', 'f1@3px',
-    'clDice',
-    'betti_0_error_raw',       # raw: disconnected RL paths, no post-processing
-    'betti_0_error_postproc',  # after dilation + re-skeletonize
-    'hd95',
+# Standardised metric columns — shared across all baseline scripts
+METRIC_COLS = [
+    "iou",
+    "clDice",
+    "betti_0_error_raw",
+    "betti_0_error_postproc",
+    "hd95",
+    "f1@1px",    "precision@1px", "recall@1px",
+    "f1@2px",    "precision@2px", "recall@2px",
+    "f1@3px",    "precision@3px", "recall@3px",
 ]
+
+CSV_COLUMNS = ["image_id"] + METRIC_COLS
 
 # ==========================================
 # CONFIG
@@ -123,7 +121,7 @@ SEED_CONFIG = {
 
 
 # ==========================================
-# DATA LOADING (unified dataloader)
+# DATA LOADING
 # ==========================================
 
 def _load_all_samples():
@@ -156,25 +154,14 @@ def postprocess_skeleton(traced: np.ndarray, dilation_radius: int = DILATION_RAD
       1. Binary dilation — bridges small gaps between nearby path endpoints.
       2. Re-skeletonize — thins the dilated mask back to 1px-wide centerlines.
 
-    This does NOT affect F1 / HD95 (computed on the raw traced map).
+    This does NOT affect F1 / HD95 / IoU (computed on the raw traced map).
     It is used only for Betti-0 post-processed reporting.
-
-    Args:
-        traced          : (H, W) float/uint8 — combined traced map from RL agent
-        dilation_radius : structuring element radius in pixels (default 3)
-
-    Returns:
-        (H, W) uint8 binary skeleton after dilation + thinning
     """
     binary = (traced > 0).astype(np.uint8)
-
-    # Build circular structuring element
     r  = dilation_radius
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-
     dilated = cv2.dilate(binary, se, iterations=1)
     thinned = skeletonize(dilated > 0).astype(np.uint8)
-
     return thinned
 
 
@@ -285,11 +272,6 @@ def trace_e2e_mode(ppo_model, seed_model, sample):
         h, w = sample['image'].shape[:2]
         seeds = [(h // 2, w // 2, 0.5)]
 
-    # ----------------------------------------------------------
-    # Merge detector seeds + FOV ring seeds via seeding_utils.
-    # Ring seeds guarantee peripheral coverage regardless of
-    # heatmap confidence. See rl_environment/seeding_utils.py.
-    # ----------------------------------------------------------
     merged, n_ring_added = merge_seeds(
         detector_seeds = seeds,
         fov_mask       = sample["fov_mask"],
@@ -345,19 +327,18 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
     gt_skel   = (sample['centerline'] > 0).astype(np.uint8)
 
     # ----------------------------------------------------------
-    # Metrics on RAW traced skeleton (F1, HD95, Betti-0 raw, clDice)
-    # clDice uses the GT vessel mask (full binary, not skeleton) as
-    # designed — the traced skeleton is used as the predicted mask.
+    # Metrics on RAW traced skeleton
+    # pred_vessel_mask = pred_skel (RL produces a skeleton, not a filled mask)
     # ----------------------------------------------------------
     metrics = metrics_calc.compute_all_metrics(
-        pred_skeleton=pred_skel,
-        gt_skeleton=gt_skel,
-        pred_vessel_mask=pred_skel,           # RL produces a skeleton, not a filled mask
-        gt_vessel_mask=sample['vessel_mask'],
-        fov_mask=sample['fov_mask'],
+        pred_skeleton    = pred_skel,
+        gt_skeleton      = gt_skel,
+        pred_vessel_mask = pred_skel,
+        gt_vessel_mask   = sample['vessel_mask'],
+        fov_mask         = sample['fov_mask'],
     )
     metrics['image_id']          = img_id
-    metrics['betti_0_error_raw'] = metrics.pop('betti_0_error')  # rename for CSV clarity
+    metrics['betti_0_error_raw'] = metrics.pop('betti_0_error')
 
     # ----------------------------------------------------------
     # Post-processed skeleton — Betti-0 only
@@ -373,6 +354,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
         f"  F1@2={metrics['f1@2px']:.3f}  "
         f"P@2={metrics['precision@2px']:.3f}  "
         f"R@2={metrics['recall@2px']:.3f}  "
+        f"IoU={metrics.get('iou', 0):.3f}  "
         f"HD95={metrics['hd95']:.1f}px  "
         f"Betti0(raw)={metrics['betti_0_error_raw']:.0f}  "
         f"Betti0(post)={metrics['betti_0_error_postproc']:.0f}"
@@ -380,9 +362,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
 
     overlay = make_overlay(sample['image_orig'], sample['centerline'], traced, paths)
 
-    # ----------------------------------------------------------
     # 4-panel figure
-    # ----------------------------------------------------------
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
     title_str = (
@@ -390,6 +370,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir):
         f"F1@2={metrics['f1@2px']:.3f}  "
         f"P@2={metrics['precision@2px']:.3f}  "
         f"R@2={metrics['recall@2px']:.3f}  "
+        f"IoU={metrics.get('iou', 0):.3f}  "
         f"HD95={metrics['hd95']:.1f}px  "
         f"Betti0 raw={metrics['betti_0_error_raw']:.0f} → post={metrics['betti_0_error_postproc']:.0f}  "
         f"({n_traces_used} traces)"
@@ -493,21 +474,28 @@ def main():
         print("\n" + "=" * 65)
         print(f"SUMMARY  ({len(all_metrics)} images, mode={MODE}, dilation={DILATION_RADIUS}px)")
         print("=" * 65)
-        key_metrics = [
-            'f1@1px', 'f1@2px', 'f1@3px',
-            'precision@2px', 'recall@2px',
-            'hd95',
-            'betti_0_error_raw',
-            'betti_0_error_postproc',
-        ]
-        for k in key_metrics:
+        for k in METRIC_COLS:
             vals = [m[k] for m in all_metrics if k in m]
             if vals:
                 print(f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
         print("=" * 65)
 
+        # Summary CSV (mean ± std)
+        summary_rows = [
+            {"Metric": k,
+             "Mean +/- Std": f"{np.mean([m[k] for m in all_metrics if k in m]):.4f} +/- "
+                             f"{np.std([m[k] for m in all_metrics if k in m]):.4f}"}
+            for k in METRIC_COLS
+            if any(k in m for m in all_metrics)
+        ]
+        import pandas as pd
+        summary_df = pd.DataFrame(summary_rows)
+        summary_csv = os.path.join(OUTPUT_DIR, f"metrics_summary_{MODE}.csv")
+        summary_df.to_csv(summary_csv, index=False)
+        print(f"Summary CSV → {summary_csv}")
+
     print(f"\nOutput directory : {OUTPUT_DIR}")
-    print(f"Metrics CSV      : {csv_path}")
+    print(f"Per-image CSV    : {csv_path}")
 
 
 if __name__ == "__main__":
