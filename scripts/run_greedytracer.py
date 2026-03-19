@@ -45,6 +45,17 @@ MODEL_CFG = dict(
     min_obj_size = 0,
 )
 
+# Standardised metric columns — shared across all baseline scripts
+METRIC_COLS = [
+    "iou",
+    "clDice",
+    "betti_0_error",
+    "hd95",
+    "f1@1px",    "precision@1px", "recall@1px",
+    "f1@2px",    "precision@2px", "recall@2px",
+    "f1@3px",    "precision@3px", "recall@3px",
+]
+
 # ==========================================
 # VISUALISATION SETTINGS
 # ==========================================
@@ -83,7 +94,9 @@ def save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis,
     axes[3].imshow(overlay)
     axes[3].set_title(
         f"Overlay Analysis\n"
-        f"F1@2px: {res.get('f1@2px', 0):.3f} | clDice: {res.get('clDice', 0):.3f}",
+        f"F1@2px: {res.get('f1@2px', 0):.3f} | "
+        f"clDice: {res.get('clDice', 0):.3f} | "
+        f"IoU: {res.get('iou', 0):.3f}",
         fontweight='bold', color='darkblue', fontsize=FONT_SIZE_TITLE,
     )
 
@@ -180,7 +193,6 @@ def main():
     os.makedirs(traj_dir,   exist_ok=True)
 
     # ── Data & model ────────────────────────────────────
-    # dataset    = RetinalFundusDataset(DATA_ROOT, DATASET_NAME, target="greedy_tracer")
     dataset, loader = load_dataset(DATA_ROOT, DATASET_NAME, target="greedy_tracer", batch_size=1)
     model      = GreedyTracerBaseline(**MODEL_CFG)
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
@@ -205,7 +217,16 @@ def main():
             img_rgb, external_fov_mask=fov_mask, return_vesselness=True,
         )
 
-        res = metrics_fn.compute_all_metrics(pred_skel, gt_skel, vessel_mask)
+        # Predicted vessel mask: threshold vesselness map at 0.5
+        pred_vessel_mask = (vesselness >= 0.5).astype(np.uint8) * 255
+
+        res = metrics_fn.compute_all_metrics(
+            pred_skeleton    = pred_skel,
+            gt_skeleton      = gt_skel,
+            pred_vessel_mask = pred_vessel_mask,
+            gt_vessel_mask   = vessel_mask,
+            fov_mask         = fov_mask,
+        )
         res.update({
             'image_id':   image_id,
             'num_traces': len(traces),
@@ -213,21 +234,18 @@ def main():
         })
         all_metrics.append(res)
 
-        save_standard_panel(img_rgb, vesselness, gt_skel, pred_skel,
+        gt_skel_vis   = (gt_skel > 0).astype(np.uint8) * 255
+        pred_skel_vis = (pred_skel > 0).astype(np.uint8) * 255
+
+        save_standard_panel(img_rgb, vesselness, gt_skel_vis, pred_skel_vis,
                             fov_mask, res, image_id, panels_dir)
         save_trajectory_panel(vesselness, fov_mask, traces, image_id, traj_dir)
 
-    # ── Summary ─────────────────────────────────────────
+    # ── Summary table + CSV ─────────────────────────────
     df = pd.DataFrame(all_metrics)
-    metric_cols = [
-        "clDice", "betti_0_error", "hd95",
-        "f1@1px", "precision@1px", "recall@1px",
-        "f1@2px", "precision@2px", "recall@2px",
-        "f1@3px", "precision@3px", "recall@3px",
-    ]
     summary_rows = [
         {"Metric": c, "Mean +/- Std": f"{df[c].mean():.4f} +/- {df[c].std():.4f}"}
-        for c in metric_cols if c in df.columns
+        for c in METRIC_COLS if c in df.columns
     ]
     summary_df = pd.DataFrame(summary_rows)
 
@@ -239,6 +257,7 @@ def main():
 
     summary_df.to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"), index=False)
     df.to_csv(os.path.join(OUTPUT_DIR, "metrics_per_image.csv"), index=False)
+    print(f"CSVs saved → {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
