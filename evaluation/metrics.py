@@ -8,6 +8,7 @@ Includes:
 - cl_dice_from_probs (threshold prob map → binary → clDice)
 - Betti-0 error (connected component difference)
 - HD95 (95th percentile Hausdorff distance)
+- IoU (Intersection over Union for binary vessel masks)
 
 Note on clDice:
     Training uses a differentiable soft-skeleton approximation (see CenterlineLoss).
@@ -102,7 +103,13 @@ class CenterlineMetrics:
                 metrics['clDice'] = self.cl_dice(pred_vessel_mask, gt_vessel_mask)
 
         # --------------------------------------------------------
-        # 3. Topology Metrics
+        # 3. IoU (mask-based)
+        # --------------------------------------------------------
+        if pred_vessel_mask is not None and gt_vessel_mask is not None:
+            metrics['iou'] = self.iou(pred_vessel_mask, gt_vessel_mask)
+
+        # --------------------------------------------------------
+        # 4. Topology Metrics
         # --------------------------------------------------------
         metrics['betti_0_error'] = self.betti_0_error(pred_skeleton, gt_skeleton)
         metrics['hd95']          = self.hd95(pred_skeleton, gt_skeleton)
@@ -212,6 +219,36 @@ class CenterlineMetrics:
         """
         pred_bin = (pred_prob >= prob_threshold).astype(np.uint8)
         return self.cl_dice(pred_bin, gt_vessel_mask)
+
+    # ============================================================
+    # IoU (Mask-Based)
+    # ============================================================
+
+    def iou(
+        self,
+        pred_mask: np.ndarray,
+        gt_mask: np.ndarray,
+    ) -> float:
+        """
+        Intersection over Union for binary vessel masks.
+
+        IoU = |P ∩ G| / |P ∪ G|
+
+        Returns 1.0 if both masks are empty (perfect agreement),
+        0.0 if exactly one is empty.
+        """
+        pred_bin = pred_mask > 0
+        gt_bin   = gt_mask   > 0
+
+        if pred_bin.sum() == 0 and gt_bin.sum() == 0:
+            return 1.0
+        if pred_bin.sum() == 0 or gt_bin.sum() == 0:
+            return 0.0
+
+        intersection = np.logical_and(pred_bin, gt_bin).sum()
+        union        = np.logical_or(pred_bin,  gt_bin).sum()
+
+        return float(intersection / union)
 
     # ============================================================
     # BETTI-0 ERROR
