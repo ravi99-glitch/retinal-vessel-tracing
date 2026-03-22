@@ -305,55 +305,42 @@ def evaluate_and_visualize(
 # MAIN
 # ==========================================
 if __name__ == "__main__":
-    RUN_TRAINING = True
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true", help="Train the model")
+    parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
+    parser.add_argument("--test", action="store_true", help="Test on external datasets")
+    args = parser.parse_args()
+
+    if not args.train and not args.eval and not args.test:
+        args.train = args.eval = args.test = True
+
     OUTPUT_DIR = str(_OUTPUT_BASE / "unet")
 
-    # Combined multi-dataset train/val
-    train_ds, train_loader = get_data(
-        "unet",
-        "train",
-        batch_size=BATCH_SIZE,
-        resize=RESIZE,
-        transform=get_train_transforms(),
-    )
-    val_ds, val_loader = get_data(
-        "unet",
-        "val",
-        batch_size=1,
-        resize=RESIZE,
-    )
-
-    print(f"[Combined]  train={len(train_ds)}  val={len(val_ds)}")
-
-    if RUN_TRAINING:
+    if args.train:
+        train_ds, train_loader = get_data(
+            "unet", "train", batch_size=BATCH_SIZE,
+            resize=RESIZE, transform=get_train_transforms(),
+        )
+        val_ds, val_loader = get_data(
+            "unet", "val", batch_size=1,
+            resize=RESIZE,
+        )
+        print(f"[Combined]  train={len(train_ds)}  val={len(val_ds)}")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        model = CenterlineUNet(**MODEL_CFG).to(DEVICE)
+        model     = CenterlineUNet(**MODEL_CFG).to(DEVICE)
         criterion = CenterlineLoss(0.4, 0.6, pos_weight=10.0)
         optimizer = optim.AdamW(model.parameters(), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
         train_hist, val_hist = [], []
-        best_val_loss = float("inf")
+        best_val_loss = float('inf')
 
         print(f"--- Training ({EPOCHS} epochs) ---")
         for epoch in range(1, EPOCHS + 1):
-            t_loss = run_epoch(
-                model,
-                train_loader,
-                criterion,
-                optimizer,
-                DEVICE,
-                "Train",
-            )
-            v_loss = run_epoch(
-                model,
-                val_loader,
-                criterion,
-                None,
-                DEVICE,
-                "Val",
-            )
+            t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, "Train")
+            v_loss = run_epoch(model, val_loader, criterion, None, DEVICE, "Val")
             train_hist.append(t_loss)
             val_hist.append(v_loss)
             scheduler.step()
@@ -362,40 +349,29 @@ if __name__ == "__main__":
                 best_val_loss = v_loss
                 os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
                 torch.save(
-                    {"model_state": model.state_dict(), "model_cfg": MODEL_CFG},
+                    {'model_state': model.state_dict(), 'model_cfg': MODEL_CFG},
                     SAVE_PATH,
                 )
 
             if epoch % 10 == 0 or epoch == 1:
-                print(
-                    f"  Epoch {epoch:>3}/{EPOCHS}  "
-                    f"train={t_loss:.4f}  val={v_loss:.4f}"
-                )
+                print(f"  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}")
 
-        plot_loss_curves(
-            train_hist,
-            val_hist,
-            os.path.join(OUTPUT_DIR, "training_val_curves.png"),
-        )
+        plot_loss_curves(train_hist, val_hist, os.path.join(OUTPUT_DIR, "training_val_curves.png"))
         print(f"Best val loss: {best_val_loss:.4f}")
 
-    if os.path.exists(SAVE_PATH):
+    if args.eval and os.path.exists(SAVE_PATH):
+        val_ds, _ = get_data("unet", "val", batch_size=1, resize=RESIZE)
+        val_output_dir = str(_OUTPUT_BASE / "unet" / "val")
+        os.makedirs(val_output_dir, exist_ok=True)
+        evaluate_and_visualize(SAVE_PATH, val_ds, split_label="Val", output_dir=val_output_dir)
+
+    if args.test and os.path.exists(SAVE_PATH):
         for ext_name in TEST_DATASETS:
             try:
-                ext_ds, _ = get_test_data(
-                    ext_name,
-                    "unet",
-                    batch_size=1,
-                    resize=RESIZE,
-                )
+                ext_ds, _ = get_test_data(ext_name, "unet", batch_size=1, resize=RESIZE)
             except (KeyError, FileNotFoundError) as exc:
                 print(f"Skipping external test set {ext_name}: {exc}")
                 continue
             ext_output_dir = str(_OUTPUT_BASE / "unet" / ext_name)
             os.makedirs(ext_output_dir, exist_ok=True)
-            evaluate_and_visualize(
-                SAVE_PATH,
-                ext_ds,
-                split_label=ext_name,
-                output_dir=ext_output_dir,
-            )
+            evaluate_and_visualize(SAVE_PATH, ext_ds, split_label=ext_name, output_dir=ext_output_dir)

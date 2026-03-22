@@ -127,7 +127,11 @@ SEED_CONFIG = {
 # DATA LOADING
 # ==========================================
 def _load_all_samples(dataset_name):
+    from data.dataloader import DATASET_REGISTRY
     ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
+    cfg = DATASET_REGISTRY.get(dataset_name.upper(), None)
+    no_fov = cfg.no_fov if cfg else False
+
     samples = {}
     for i in range(len(ds)):
         s = ds[i]
@@ -140,7 +144,23 @@ def _load_all_samples(dataset_name):
             "distance_transform": s["distance_transform"].squeeze(0).numpy(),
             "fov_mask": s["fov_mask"].squeeze(0).numpy(),
         }
-    return samples
+    return samples, no_fov
+
+# def _load_all_samples(dataset_name):
+#     ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
+#     samples = {}
+#     for i in range(len(ds)):
+#         s = ds[i]
+#         samples[s["id"]] = {
+#             "id": s["id"],
+#             "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
+#             "image": s["image"].permute(1, 2, 0).numpy(),
+#             "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
+#             "centerline": s["centerline"].squeeze(0).numpy(),
+#             "distance_transform": s["distance_transform"].squeeze(0).numpy(),
+#             "fov_mask": s["fov_mask"].squeeze(0).numpy(),
+#         }
+#     return samples
 
 
 # ==========================================
@@ -290,15 +310,25 @@ def trace_e2e_mode(ppo_model, seed_model, sample):
         tqdm.write("    WARNING: No seeds found, falling back to image centre")
         h, w = sample["image"].shape[:2]
         seeds = [(h // 2, w // 2, 0.5)]
-
+    
+    n_ring = 0 if no_fov else N_RING_SEEDS
     merged, n_ring_added = merge_seeds(
         detector_seeds=seeds,
         fov_mask=sample["fov_mask"],
         max_traces=MAX_TRACES,
-        n_ring_seeds=N_RING_SEEDS,
+        n_ring_seeds=n_ring,
         inset_px=RING_INSET_PX,
         obs_half=OBS_SIZE // 2,
     )
+
+    # merged, n_ring_added = merge_seeds(
+    #     detector_seeds=seeds,
+    #     fov_mask=sample["fov_mask"],
+    #     max_traces=MAX_TRACES,
+    #     n_ring_seeds=N_RING_SEEDS,
+    #     inset_px=RING_INSET_PX,
+    #     obs_half=OBS_SIZE // 2,
+    # )
     tqdm.write(
         f"    Detector seeds (capped): {MAX_TRACES - N_RING_SEEDS}  "
         f"Ring seeds added: {n_ring_added}  "
@@ -334,14 +364,14 @@ def make_overlay(image_orig, gt_centerline, traced, paths):
     return overlay
 
 
-def visualize_sample(ppo_model, seed_model, sample, output_dir):
+def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
     img_id = sample["id"]
     tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE}]")
 
     if MODE == "gt":
         traced, paths = trace_gt_mode(ppo_model, sample)
     else:
-        traced, paths = trace_e2e_mode(ppo_model, seed_model, sample)
+        traced, paths = trace_e2e_mode(ppo_model, seed_model, sample, no_fov=no_fov)
 
     pred_skel = (traced > 0).astype(np.uint8)
     gt_skel = (sample["centerline"] > 0).astype(np.uint8)
@@ -456,6 +486,15 @@ def append_csv(csv_path: str, metrics: dict):
 # MAIN
 # ==========================================
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
+    parser.add_argument("--test", action="store_true", help="Test on external datasets")
+    args = parser.parse_args()
+
+    if not args.eval and not args.test:
+        args.eval = args.test = True
+
     print(f"Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px")
 
     # Load PPO model
@@ -472,7 +511,35 @@ def main():
         seed_model.load_state_dict(seed_ckpt["model_state_dict"])
         seed_model.eval()
 
-    for dataset_name in TEST_DATASETS:
+    if args.eval:
+        _run_on_datasets(ppo_model, seed_model, ("val",), label="val")
+
+    if args.test:
+        _run_on_datasets(ppo_model, seed_model, TEST_DATASETS, label="test")
+
+
+def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
+    """Run tracing + evaluation on a list of datasets."""
+    for dataset_name in dataset_names:
+        # Load data
+        if dataset_name == "val":
+            from data.dataloader import get_data
+            ds, _ = get_data("rl_agent", "val", tolerance=TOLERANCE, resize=(512, 512))
+            samples = {}
+            for i in range(len(ds)):
+                s = ds[i]
+                samples[s["id"]] = {
+                    "id": s["id"],
+                    "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
+                    "image": s["image"].permute(1, 2, 0).numpy(),
+                    "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
+                    "centerline": s["centerline"].squeeze(0).numpy(),
+                    "distance_transform": s["distance_transform"].squeeze(0).numpy(),
+                    "fov_mask": s["fov_mask"].squeeze(0).numpy(),
+                }
+        else:
+            samples, no_fov = _load_all_samples(dataset_name)
+
         output_dir = str(_OUTPUT_BASE / f"RL_tracing_{MODE}" / dataset_name)
         os.makedirs(output_dir, exist_ok=True)
 
@@ -480,14 +547,13 @@ def main():
         init_csv(csv_path)
         print(f"\n[{dataset_name}] CSV → {csv_path}")
 
-        all_samples = _load_all_samples(dataset_name)
         all_metrics = []
 
         for img_id in tqdm(
-            all_samples.keys(), desc=f"RL Tracing — {dataset_name}", unit="img"
+            samples.keys(), desc=f"RL Tracing — {dataset_name}", unit="img"
         ):
-            sample = all_samples[img_id]
-            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir)
+            sample = samples[img_id]
+            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=no_fov)
             append_csv(csv_path, metrics)
             all_metrics.append(metrics)
 
@@ -499,13 +565,10 @@ def main():
             for k in METRIC_COLS:
                 vals = [m[k] for m in all_metrics if k in m]
                 if vals:
-                    print(
-                        f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}"
-                    )
+                    print(f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
             print("=" * 65)
 
             import pandas as pd
-
             summary_rows = [
                 {
                     "Metric": k,

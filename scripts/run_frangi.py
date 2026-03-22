@@ -44,6 +44,36 @@ METRIC_COLS = [
     "recall@3px",
 ]
 
+# ==========================================
+# PER-DATASET FRANGI PARAMETERS
+# ==========================================
+FRANGI_PARAMS = {
+    "AV-WIDE": dict(
+        sigma_min=1.5,
+        sigma_max=8.0,
+        num_scales=8,
+        threshold=0.02,
+        gauss_sigma=1.5,
+        min_size=100,
+    ),
+    "DRHAGIS": dict(
+        sigma_min=1.0,
+        sigma_max=5.0,
+        num_scales=6,
+        threshold=0.03,
+        gauss_sigma=1.0,
+        min_size=50,
+    ),
+}
+
+DEFAULT_FRANGI_PARAMS = dict(
+    sigma_min=1.0,
+    sigma_max=3.0,
+    num_scales=5,
+    threshold=0.05,
+    gauss_sigma=1.0,
+    min_size=50,
+)
 
 # ==========================================
 # MAIN
@@ -53,8 +83,9 @@ def evaluate(dataset_name):
     panels_dir = os.path.join(output_dir, "panels")
     os.makedirs(panels_dir, exist_ok=True)
 
-    dataset, loader = get_test_data(dataset_name, "frangi", batch_size=1)
-    model = FrangiBaseline()
+    dataset, loader = get_test_data(dataset_name, "frangi", batch_size=1, resize=None)
+    params = FRANGI_PARAMS.get(dataset_name, DEFAULT_FRANGI_PARAMS)
+    model = FrangiBaseline(**params)
     metrics_calculator = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
     print(f"[{dataset_name}]  {len(dataset)} images\n")

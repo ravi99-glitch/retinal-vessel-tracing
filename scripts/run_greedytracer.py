@@ -225,7 +225,7 @@ def evaluate(dataset_name):
     os.makedirs(panels_dir, exist_ok=True)
     os.makedirs(traj_dir, exist_ok=True)
 
-    dataset, loader = get_test_data(dataset_name, "greedy_tracer", batch_size=1)
+    dataset, loader = get_test_data(dataset_name, "greedy_tracer", batch_size=1, resize=None)
     model = GreedyTracerBaseline(**MODEL_CFG)
     metrics_fn = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
