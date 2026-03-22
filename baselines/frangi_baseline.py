@@ -1,6 +1,5 @@
 # frangi_baseline.py
-"""
-==================
+"""==================
 Frangi Vesselness Baseline with Topological Pruning.
 
 Workflow:
@@ -12,19 +11,21 @@ Workflow:
 ==================
 """
 
-import numpy as np
-from skimage import filters, morphology
-from skimage.morphology import skeletonize, remove_small_objects
-from scipy.ndimage import gaussian_filter
 from typing import Optional, Tuple
-from skan import Skeleton as SkanSkeleton, summarize
+
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skan import Skeleton as SkanSkeleton
+from skan import summarize
+from skimage import filters, morphology
+from skimage.morphology import remove_small_objects, skeletonize
 
 # Local imports
 from data.fundus_preprocessor import FundusPreprocessor
 
+
 class FrangiBaseline:
-    """
-    Classical vessel segmentation using Frangi filter, with graph-based pruning.
+    """Classical vessel segmentation using Frangi filter, with graph-based pruning.
 
     Pipeline:
     1. Preprocessing (CLAHE, Green channel, Masking)
@@ -36,55 +37,60 @@ class FrangiBaseline:
     7. SKAN Pruning (Graph-based removal of spurious tips)
     """
 
-    def __init__(self,
-                 sigma_min: float = 1.0,
-                 sigma_max: float = 3.0,
-                 num_scales: int = 5,
-                 threshold: float = 0.05,
-                 min_size: int = 50,
-                 prune_length: int = 10,
-                 gauss_sigma: float = 1.0):
+    def __init__(
+        self,
+        sigma_min: float = 1.0,
+        sigma_max: float = 3.0,
+        num_scales: int = 5,
+        threshold: float = 0.05,
+        min_size: int = 50,
+        prune_length: int = 10,
+        gauss_sigma: float = 1.0,
+    ):
 
-        self.sigma_min    = sigma_min
-        self.sigma_max    = sigma_max
-        self.num_scales   = num_scales
-        self.threshold    = threshold
-        self.min_size     = min_size
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.num_scales = num_scales
+        self.threshold = threshold
+        self.min_size = min_size
         self.prune_length = prune_length
-        self.gauss_sigma  = gauss_sigma
+        self.gauss_sigma = gauss_sigma
 
         self.preprocessor = FundusPreprocessor()
 
-    def extract_centerline(self,
-                           image: np.ndarray,
-                           return_vesselness: bool = False,
-                           external_fov_mask: Optional[np.ndarray] = None
-                           ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
-        """
-        Extract a 1-pixel skeleton from a fundus image.
+    def extract_centerline(
+        self,
+        image: np.ndarray,
+        return_vesselness: bool = False,
+        external_fov_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+        """Extract a 1-pixel skeleton from a fundus image.
 
         Returns:
             skeleton (np.ndarray): 1-pixel centerline of vessels
             vesselness (np.ndarray or None): Frangi vesselness map if requested
             binary_mask (np.ndarray): Binary vessel mask after thresholding and cleanup
+
         """
         preprocessed, _, _, _, mask = self.preprocessor.preprocess(
-            image,
-            external_mask=external_fov_mask,
-            return_intermediate=True
+            image, external_mask=external_fov_mask, return_intermediate=True
         )
 
         # 1. Frangi vesselness
         sigmas = np.linspace(self.sigma_min, self.sigma_max, self.num_scales)
-        vesselness = filters.frangi(preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True)
-        vesselness = (vesselness - vesselness.min()) / (vesselness.max() - vesselness.min() + 1e-8)
+        vesselness = filters.frangi(
+            preprocessed.astype(np.float64), sigmas=sigmas, black_ridges=True
+        )
+        vesselness = (vesselness - vesselness.min()) / (
+            vesselness.max() - vesselness.min() + 1e-8
+        )
 
         # 2. Gaussian smoothing — suppresses background noise before thresholding
         #    Keep gauss_sigma in range 1.0–1.5; higher values blur vessel edges
         if self.gauss_sigma > 0:
             vesselness = gaussian_filter(vesselness, sigma=self.gauss_sigma)
 
-        vesselness *= (mask > 0)
+        vesselness *= mask > 0
 
         # 3. Binary segmentation + morphological cleanup
         binary = vesselness > self.threshold
@@ -105,15 +111,16 @@ class FrangiBaseline:
         return skeleton.astype(np.float32), vesselness, binary.astype(np.uint8)
 
     def _prune_with_skan(self, skeleton_img: np.ndarray) -> np.ndarray:
-        """
-        Remove short spur branches ending in tips using SKAN graph.
+        """Remove short spur branches ending in tips using SKAN graph.
         """
         try:
             skel = SkanSkeleton(skeleton_img)
-            stats = summarize(skel, separator='_')
+            stats = summarize(skel, separator="_")
 
-            short_tips = stats[(stats['branch-type'] == 1) &
-                               (stats['branch-distance'] < self.prune_length)]
+            short_tips = stats[
+                (stats["branch-type"] == 1)
+                & (stats["branch-distance"] < self.prune_length)
+            ]
             pruned_skeleton = skeleton_img.copy()
 
             for edge_idx in short_tips.index:

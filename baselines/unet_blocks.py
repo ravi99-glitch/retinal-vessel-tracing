@@ -1,6 +1,5 @@
 # baselines/unet_blocks.py
-"""
-Shared UNet building blocks used by CenterlineUNet and SeedDetector.
+"""Shared UNet building blocks used by CenterlineUNet and SeedDetector.
 
 - DSConvBlock : Depthwise-Separable Conv → BN → ReLU (x2)
 - DownBlock   : MaxPool → DSConvBlock
@@ -51,12 +50,14 @@ class UpBlock(nn.Module):
 
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.conv = DSConvBlock(in_ch + skip_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         # handle odd spatial dims
         if x.shape != skip.shape:
-            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+            x = F.interpolate(
+                x, size=skip.shape[2:], mode="bilinear", align_corners=False
+            )
         return self.conv(torch.cat([x, skip], dim=1))
