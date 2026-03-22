@@ -90,6 +90,7 @@ class DatasetConfig:
     vessel_suffix: str
     mask_dir: Optional[str] = None
     mask_suffix: Optional[str] = None
+    no_fov: bool = False
     stem_rule: Optional[str] = None
     train_subdir: Optional[str] = None
 
@@ -155,6 +156,7 @@ DATASET_REGISTRY: Dict[str, DatasetConfig] = {
         vessel_dir="manual",
         image_glob="*.png",
         vessel_suffix="_vessels.png",
+        no_fov=True,
     ),
     "DRHAGIS": DatasetConfig(
         image_dir="Fundus_Images",
@@ -354,18 +356,36 @@ class RetinalFundusDataset(Dataset):
     def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
         if "mask" in sample:
             return self._load_fov(sample["mask"])
+        if self.cfg.no_fov:
+            return np.ones(rgb.shape[:2], dtype=np.uint8) * 255
         green = self.preprocessor.extract_green_channel(rgb)
         if green.dtype != np.uint8:
             green = np.clip(green * 255, 0, 255).astype(np.uint8)
         return self.preprocessor.create_fov_mask(green)
 
+    # def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
+    #     if "mask" in sample:
+    #         return self._load_fov(sample["mask"])
+    #     green = self.preprocessor.extract_green_channel(rgb)
+    #     if green.dtype != np.uint8:
+    #         green = np.clip(green * 255, 0, 255).astype(np.uint8)
+    #     return self.preprocessor.create_fov_mask(green)
+
     # -- Resize ------------------------------------------------------------
-    def _maybe_resize(
-        self, *arrays: np.ndarray, interp: Optional[List[int]] = None
-    ) -> Tuple[np.ndarray, ...]:
+    def _maybe_resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
         if self.resize is None:
             return arrays
-        h, w = self.resize
+        target_h, target_w = self.resize
+        src_h, src_w = arrays[0].shape[:2]
+
+        # Scale to fit within target while preserving aspect ratio
+        scale = min(target_h / src_h, target_w / src_w)
+        new_h, new_w = int(src_h * scale), int(src_w * scale)
+
+        # Padding offsets (center the image)
+        pad_top = (target_h - new_h) // 2
+        pad_left = (target_w - new_w) // 2
+
         out = []
         for i, arr in enumerate(arrays):
             if interp is not None and i < len(interp):
@@ -374,8 +394,36 @@ class RetinalFundusDataset(Dataset):
                 flag = cv2.INTER_NEAREST
             else:
                 flag = cv2.INTER_LINEAR
-            out.append(cv2.resize(arr, (w, h), interpolation=flag))
+
+            resized = cv2.resize(arr, (new_w, new_h), interpolation=flag)
+
+            # Create padded output (black/zero padding)
+            if arr.ndim == 3:
+                padded = np.zeros((target_h, target_w, arr.shape[2]), dtype=arr.dtype)
+            else:
+                padded = np.zeros((target_h, target_w), dtype=arr.dtype)
+
+            padded[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+            out.append(padded)
+
         return tuple(out)
+    
+    # def _maybe_resize(
+    #     self, *arrays: np.ndarray, interp: Optional[List[int]] = None
+    # ) -> Tuple[np.ndarray, ...]:
+    #     if self.resize is None:
+    #         return arrays
+    #     h, w = self.resize
+    #     out = []
+    #     for i, arr in enumerate(arrays):
+    #         if interp is not None and i < len(interp):
+    #             flag = interp[i]
+    #         elif arr.ndim == 2:
+    #             flag = cv2.INTER_NEAREST
+    #         else:
+    #             flag = cv2.INTER_LINEAR
+    #         out.append(cv2.resize(arr, (w, h), interpolation=flag))
+    #     return tuple(out)
 
     # -- __len__ / __getitem__ ---------------------------------------------
     def __len__(self) -> int:
