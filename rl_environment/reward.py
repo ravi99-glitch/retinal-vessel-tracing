@@ -1,15 +1,14 @@
 # reward.py
-"""
-Reward calculation for vessel tracing.
+"""Reward calculation for vessel tracing.
 """
 
+from typing import Any, Dict, Optional
+
 import numpy as np
-from typing import Dict, Any, Optional
 
 
 class RewardCalculator:
-    """
-    Calculates rewards for the vessel tracing agent.
+    """Calculates rewards for the vessel tracing agent.
 
     Reward components:
     - Proximity reward (staying near centerline, only on NEW positions)
@@ -25,30 +24,32 @@ class RewardCalculator:
     """
 
     def __init__(self, config: Dict[str, Any]):
-        reward_config = config.get('reward', {})
+        reward_config = config.get("reward", {})
 
-        self.alpha                = reward_config.get('alpha_near',           1.0)
-        self.beta                 = reward_config.get('beta_coverage',         2.0)
-        self.gamma_off            = reward_config.get('gamma_off',            -1.0)
-        self.lambda_revisit       = reward_config.get('lambda_revisit',       -0.5)
-        self.step_cost            = reward_config.get('step_cost',            -0.01)
-        self.terminal_f1_weight   = reward_config.get('terminal_f1_weight',   10.0)
-        self.use_potential_shaping = reward_config.get('use_potential_shaping', True)
+        self.alpha = reward_config.get("alpha_near", 1.0)
+        self.beta = reward_config.get("beta_coverage", 2.0)
+        self.gamma_off = reward_config.get("gamma_off", -1.0)
+        self.lambda_revisit = reward_config.get("lambda_revisit", -0.5)
+        self.step_cost = reward_config.get("step_cost", -0.01)
+        self.terminal_f1_weight = reward_config.get("terminal_f1_weight", 10.0)
+        self.use_potential_shaping = reward_config.get("use_potential_shaping", True)
 
-        self.tolerance = config.get('environment', {}).get('tolerance', 2.0)
-        self.gamma     = config.get('training', {}).get('ppo', {}).get('gamma', 0.99)
+        self.tolerance = config.get("environment", {}).get("tolerance", 2.0)
+        self.gamma = config.get("training", {}).get("ppo", {}).get("gamma", 0.99)
 
-        self.out_of_bounds_penalty         = -10.0
+        self.out_of_bounds_penalty = -10.0
         self.off_track_termination_penalty = -5.0
 
-    def compute_step_reward(self,
-                            distance:      float,
-                            is_revisit:    bool,
-                            is_on_track:   bool,
-                            new_coverage:  float,
-                            prev_distance: float,
-                            action:        int,
-                            prev_action:   Optional[int]) -> float:
+    def compute_step_reward(
+        self,
+        distance: float,
+        is_revisit: bool,
+        is_on_track: bool,
+        new_coverage: float,
+        prev_distance: float,
+        action: int,
+        prev_action: Optional[int],
+    ) -> float:
         reward = 0.0
 
         # 1. Proximity reward — only on unvisited positions
@@ -76,21 +77,24 @@ class RewardCalculator:
 
         return reward
 
-    def compute_terminal_reward(self,
-                                covered_centerline: np.ndarray,
-                                gt_centerline:      np.ndarray) -> float:
+    def compute_terminal_reward(
+        self, covered_centerline: np.ndarray, gt_centerline: np.ndarray
+    ) -> float:
         covered = covered_centerline > 0
-        gt      = gt_centerline > 0
+        gt = gt_centerline > 0
 
-        tp  = np.logical_and(covered, gt).sum()
-        pp  = covered.sum()
-        ap  = gt.sum()
+        tp = np.logical_and(covered, gt).sum()
+        pp = covered.sum()
+        ap = gt.sum()
 
         precision = tp / max(pp, 1)
-        recall    = tp / max(ap, 1)
+        recall = tp / max(ap, 1)
 
-        f1 = (2 * precision * recall / (precision + recall)
-              if precision + recall > 0 else 0.0)
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
 
         return self.terminal_f1_weight * f1
 

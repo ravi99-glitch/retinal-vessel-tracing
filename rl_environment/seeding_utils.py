@@ -1,6 +1,5 @@
 # rl_environment/seeding_utils.py
-"""
-Reusable seed generation utilities for retinal vessel tracing.
+"""Reusable seed generation utilities for retinal vessel tracing.
 
 Provides:
   - fov_ring_seeds   : evenly-spaced peripheral seeds just inside the FOV boundary
@@ -11,28 +10,28 @@ Designed to be imported by any inference or evaluation script:
     from rl_environment.seeding_utils import fov_ring_seeds, merge_seeds
 """
 
+from typing import List, Tuple
+
 import cv2
 import numpy as np
-from typing import List, Tuple
 
 # ---------------------------------------------------------------------------
 # Default parameters — override by passing kwargs or changing module-level
 # constants if you want a different default across all scripts.
 # ---------------------------------------------------------------------------
-DEFAULT_N_RING_SEEDS  = 24    # angular samples around FOV ring (every 15°)
-DEFAULT_RING_INSET_PX = 40    # erosion depth — keeps seeds away from hard edges
-DEFAULT_RING_DEDUP_PX = 35    # skip ring seed if a detector seed is within this distance
-DEFAULT_OBS_HALF      = 32    # half-width of observation patch (OBS_SIZE // 2)
+DEFAULT_N_RING_SEEDS = 24  # angular samples around FOV ring (every 15°)
+DEFAULT_RING_INSET_PX = 40  # erosion depth — keeps seeds away from hard edges
+DEFAULT_RING_DEDUP_PX = 35  # skip ring seed if a detector seed is within this distance
+DEFAULT_OBS_HALF = 32  # half-width of observation patch (OBS_SIZE // 2)
 
 
 def fov_ring_seeds(
     fov_mask: np.ndarray,
-    n_seeds: int  = DEFAULT_N_RING_SEEDS,
+    n_seeds: int = DEFAULT_N_RING_SEEDS,
     inset_px: int = DEFAULT_RING_INSET_PX,
     obs_half: int = DEFAULT_OBS_HALF,
 ) -> List[Tuple[int, int]]:
-    """
-    Generate evenly-spaced seed points just inside the FOV boundary.
+    """Generate evenly-spaced seed points just inside the FOV boundary.
 
     Motivation:
         The seed detector is confidence-driven and clusters seeds on thick,
@@ -59,23 +58,24 @@ def fov_ring_seeds(
     Example:
         seeds = fov_ring_seeds(fov_mask, n_seeds=24, inset_px=40)
         returns up to 24 (y, x) tuples around the FOV perimeter
+
     """
     h, w = fov_mask.shape
 
     # ---- Build inner ring band ----
-    se     = cv2.getStructuringElement(
+    se = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (2 * inset_px + 1, 2 * inset_px + 1)
     )
     eroded = cv2.erode(fov_mask.astype(np.uint8), se, iterations=1)
-    ring   = (fov_mask > 0) & (eroded == 0)
+    ring = (fov_mask > 0) & (eroded == 0)
 
     if not ring.any():
         return []
 
     # ---- FOV centroid as angular reference ----
-    fov_pts  = np.argwhere(fov_mask > 0)
-    cy, cx   = fov_pts.mean(axis=0)
-    ring_pts = np.argwhere(ring)   # (N, 2)
+    fov_pts = np.argwhere(fov_mask > 0)
+    cy, cx = fov_pts.mean(axis=0)
+    ring_pts = np.argwhere(ring)  # (N, 2)
 
     # ---- Safe zone: agent needs a full obs_half patch from every seed ----
     safe_y0, safe_y1 = obs_half + 2, h - obs_half - 3
@@ -84,17 +84,17 @@ def fov_ring_seeds(
     seeds = []
     for i in range(n_seeds):
         angle = 2 * np.pi * i / n_seeds
-        dy    = np.sin(angle)
-        dx    = np.cos(angle)
+        dy = np.sin(angle)
+        dx = np.cos(angle)
 
         # Score every ring pixel by alignment with this direction
-        rel_y  = ring_pts[:, 0] - cy
-        rel_x  = ring_pts[:, 1] - cx
+        rel_y = ring_pts[:, 0] - cy
+        rel_x = ring_pts[:, 1] - cx
         scores = rel_y * dy + rel_x * dx
 
         best = ring_pts[np.argmax(scores)]
-        y    = int(np.clip(best[0], safe_y0, safe_y1))
-        x    = int(np.clip(best[1], safe_x0, safe_x1))
+        y = int(np.clip(best[0], safe_y0, safe_y1))
+        x = int(np.clip(best[1], safe_x0, safe_x1))
         seeds.append((y, x))
 
     # Deduplicate — multiple angles can snap to the same pixel on small FOVs
@@ -106,13 +106,12 @@ def merge_seeds(
     detector_seeds: List[Tuple[int, int, float]],
     fov_mask: np.ndarray,
     max_traces: int,
-    n_ring_seeds: int  = DEFAULT_N_RING_SEEDS,
-    inset_px: int      = DEFAULT_RING_INSET_PX,
-    dedup_px: int      = DEFAULT_RING_DEDUP_PX,
-    obs_half: int      = DEFAULT_OBS_HALF,
+    n_ring_seeds: int = DEFAULT_N_RING_SEEDS,
+    inset_px: int = DEFAULT_RING_INSET_PX,
+    dedup_px: int = DEFAULT_RING_DEDUP_PX,
+    obs_half: int = DEFAULT_OBS_HALF,
 ) -> Tuple[List[Tuple[int, int]], int]:
-    """
-    Merge detector seeds and FOV ring seeds with explicit slot reservation.
+    """Merge detector seeds and FOV ring seeds with explicit slot reservation.
 
     Slot reservation guarantee:
         n_ring_seeds slots are always reserved for ring seeds so they cannot
@@ -142,18 +141,20 @@ def merge_seeds(
         merged, n_added = merge_seeds(detector_seeds, fov_mask,
         ...                               max_traces=80, n_ring_seeds=24)
         print(f'Ring seeds added: {n_added}  Total: {len(merged)}')
+
     """
     detector_slots = max_traces - n_ring_seeds
-    detector_pts   = [(y, x) for y, x, _ in detector_seeds[:detector_slots]]
+    detector_pts = [(y, x) for y, x, _ in detector_seeds[:detector_slots]]
 
-    ring_pts    = fov_ring_seeds(fov_mask, n_seeds=n_ring_seeds,
-                                 inset_px=inset_px, obs_half=obs_half)
+    ring_pts = fov_ring_seeds(
+        fov_mask, n_seeds=n_ring_seeds, inset_px=inset_px, obs_half=obs_half
+    )
     added_rings = []
     for ry, rx in ring_pts:
         if any(abs(ry - sy) + abs(rx - sx) < dedup_px for sy, sx in detector_pts):
             continue
         added_rings.append((ry, rx))
 
-    merged  = detector_pts + added_rings
+    merged = detector_pts + added_rings
     n_added = len(added_rings)
     return merged, n_added
