@@ -10,6 +10,7 @@ import sys
 import cv2
 import matplotlib
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -568,7 +569,6 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
                     print(f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
             print("=" * 65)
 
-            import pandas as pd
             summary_rows = [
                 {
                     "Metric": k,

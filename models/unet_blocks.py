@@ -1,5 +1,6 @@
-# baselines/unet_blocks.py
-"""Shared UNet building blocks used by CenterlineUNet and SeedDetector.
+# unet_blocks.py
+"""
+Shared UNet building blocks used by CenterlineUNet and SeedDetector.
 
 - DSConvBlock : Depthwise-Separable Conv → BN → ReLU (x2)
 - DownBlock   : MaxPool → DSConvBlock

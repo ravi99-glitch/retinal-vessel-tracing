@@ -1,5 +1,6 @@
-# greedy_tracer_baseline.py
-"""==================
+# greedy_tracer.py
+"""
+==================
 Greedy Tracer Baseline for Vessel Extraction
 
 Workflow:

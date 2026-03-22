@@ -1,5 +1,6 @@
-# centerline_unet_baseline.py
-"""==================
+# unet.py
+"""
+==================
 Lightweight Centerline UNet for retinal vessel centerline probability estimation.
 
 Architecture:

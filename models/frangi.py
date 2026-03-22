@@ -1,5 +1,6 @@
-# frangi_baseline.py
-"""==================
+# frangi.py
+"""
+==================
 Frangi Vesselness Baseline with Topological Pruning.
 
 Workflow:

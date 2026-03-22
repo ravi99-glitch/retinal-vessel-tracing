@@ -1,5 +1,6 @@
 # policy_network.py
-"""Policy network for vessel tracing RL agent.
+"""
+Policy network for vessel tracing RL agent.
 Actor-Critic architecture with CNN encoder + LSTM.
 """
 
