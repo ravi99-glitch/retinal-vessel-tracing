@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from baselines.greedy_tracer_baseline import GreedyTracerBaseline
+from models.greedy_tracer import GreedyTracerBaseline
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, get_test_data
 from evaluation.metrics import CenterlineMetrics

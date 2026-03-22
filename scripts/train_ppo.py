@@ -14,8 +14,8 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.dataloader import WEIGHTS_DIR, get_data
-from rl_models.policy_network import ActorCriticNetwork
-from rl_training.ppo import PPOTrainer
+from models.policy_network import ActorCriticNetwork
+from training.ppo import PPOTrainer
 
 # ==========================================
 # CONFIG

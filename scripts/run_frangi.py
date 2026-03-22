@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from baselines.frangi_baseline import FrangiBaseline
+from models.frangi import FrangiBaseline
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, get_test_data
 from evaluation.metrics import CenterlineMetrics

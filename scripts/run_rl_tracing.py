@@ -23,11 +23,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_test_data
 from evaluation.metrics import CenterlineMetrics
-from rl_environment.frontier_tracer import FrontierTracer
-from rl_environment.seeding_utils import merge_seeds
-from rl_environment.vessel_env import VesselTracingEnv
-from rl_models.policy_network import ActorCriticNetwork
-from rl_models.seed_detector import SeedDetector
+from environment.frontier_tracer import FrontierTracer
+from environment.seeding_utils import merge_seeds
+from environment.vessel_env import VesselTracingEnv
+from models.policy_network import ActorCriticNetwork
+from models.seed_detector import SeedDetector
 
 # ==========================================
 # MODE — switch between gt and e2e

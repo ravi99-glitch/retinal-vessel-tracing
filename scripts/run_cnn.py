@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from baselines.centerline_unet_baseline import (CenterlineLoss,
+from models.unet import (CenterlineLoss,
                                                 CenterlinePredictor,
                                                 CenterlineUNet)
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE

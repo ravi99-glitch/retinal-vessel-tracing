@@ -18,8 +18,8 @@ import torch
 
 from data.centerline_extraction import CenterlineExtractor
 from data.dataloader import WEIGHTS_DIR, get_data
-from rl_models.policy_network import ActorCriticNetwork
-from rl_training.imitation import (ImitationTrainer, augment_sample,
+from models.policy_network import ActorCriticNetwork
+from training.imitation import (ImitationTrainer, augment_sample,
                                    generate_expert_pairs)
 
 # ==========================================

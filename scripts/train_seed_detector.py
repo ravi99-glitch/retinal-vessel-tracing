@@ -24,8 +24,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.centerline_extraction import CenterlineExtractor
 from data.dataloader import WEIGHTS_DIR, get_data
-from rl_models.seed_detector import SeedDetector
-from rl_training.seed_detector_trainer import SeedDetectorTrainer
+from models.seed_detector import SeedDetector
+from training.seed_detector_trainer import SeedDetectorTrainer
 
 # ==========================================
 # CONFIG
