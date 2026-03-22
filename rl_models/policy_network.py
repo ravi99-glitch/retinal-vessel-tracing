@@ -1,18 +1,17 @@
 # policy_network.py
-"""
-Policy network for vessel tracing RL agent.
+"""Policy network for vessel tracing RL agent.
 Actor-Critic architecture with CNN encoder + LSTM.
 """
+
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional, Tuple
 
 
 def _compute_in_channels(config: Dict[str, Any]) -> int:
-    """
-    Single source of truth for input channel count.
+    """Single source of truth for input channel count.
 
     Channels:
       RGB             : 3
@@ -24,8 +23,8 @@ def _compute_in_channels(config: Dict[str, Any]) -> int:
 
     Total (default): 7
     """
-    n = 3 + 1 + 1 + 1 + 1   # RGB + visited + dt + grad_y + grad_x = 7
-    if config.get('environment', {}).get('use_vesselness', False):
+    n = 3 + 1 + 1 + 1 + 1  # RGB + visited + dt + grad_y + grad_x = 7
+    if config.get("environment", {}).get("use_vesselness", False):
         n += 1
     return n
 
@@ -86,7 +85,7 @@ class ResNetEncoder(nn.Module):
             nn.ReLU(),
         )
         self.layer1 = self.ResBlock(32)
-        self.down1  = nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False)
+        self.down1 = nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False)
         self.layer2 = self.ResBlock(64)
         self.dropout = nn.Dropout(dropout)
 
@@ -114,13 +113,12 @@ class ResNetEncoder(nn.Module):
 class LSTMHead(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
-        self.lstm     = nn.LSTMCell(input_dim, hidden_dim)
+        self.lstm = nn.LSTMCell(input_dim, hidden_dim)
         self.hidden_dim = hidden_dim
 
-    def forward(self,
-                x:     torch.Tensor,
-                state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(
+        self, x: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if state is None:
             h = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
             c = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
@@ -131,8 +129,7 @@ class LSTMHead(nn.Module):
 
 
 class ActorCriticNetwork(nn.Module):
-    """
-    Actor-Critic policy network.
+    """Actor-Critic policy network.
 
     Architecture:
       CNNEncoder (or ResNetEncoder) → optional LSTMHead → actor head + value head
@@ -142,17 +139,17 @@ class ActorCriticNetwork(nn.Module):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        policy_config = config.get('policy', {})
+        policy_config = config.get("policy", {})
 
-        hidden_dim    = policy_config.get('hidden_dim',    128)
-        lstm_hidden   = policy_config.get('lstm_hidden',   128)
-        use_lstm      = policy_config.get('use_lstm',      False)
-        dropout       = policy_config.get('dropout',       0.0)
-        encoder_type  = policy_config.get('encoder_type',  'cnn')
+        hidden_dim = policy_config.get("hidden_dim", 128)
+        lstm_hidden = policy_config.get("lstm_hidden", 128)
+        use_lstm = policy_config.get("use_lstm", False)
+        dropout = policy_config.get("dropout", 0.0)
+        encoder_type = policy_config.get("encoder_type", "cnn")
 
         in_channels = _compute_in_channels(config)
 
-        if encoder_type == 'resnet':
+        if encoder_type == "resnet":
             self.encoder = ResNetEncoder(in_channels, hidden_dim, dropout)
         else:
             self.encoder = CNNEncoder(in_channels, hidden_dim, dropout)
@@ -181,7 +178,7 @@ class ActorCriticNetwork(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain("relu"))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -191,10 +188,11 @@ class ActorCriticNetwork(nn.Module):
         # Actor head: small init for initial near-uniform policy
         nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
 
-    def forward(self,
-                obs:   torch.Tensor,
-                state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple]]:
+    def forward(
+        self,
+        obs: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple]]:
         features = self.encoder(obs)
 
         if self.use_lstm:
@@ -206,20 +204,21 @@ class ActorCriticNetwork(nn.Module):
         return logits, values, state
 
     def get_action_and_value(
-            self,
-            obs:   torch.Tensor,
-            state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self,
+        obs: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple]]:
         logits, values, state = self.forward(obs, state)
-        dist     = torch.distributions.Categorical(logits=logits)
-        action   = dist.sample()
+        dist = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
         log_prob = dist.log_prob(action)
-        entropy  = dist.entropy()
+        entropy = dist.entropy()
         return action, log_prob, entropy, values, state
 
-    def get_value(self,
-                  obs:   torch.Tensor,
-                  state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-                  ) -> torch.Tensor:
+    def get_value(
+        self,
+        obs: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         _, values, _ = self.forward(obs, state)
         return values
