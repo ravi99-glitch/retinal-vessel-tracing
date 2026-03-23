@@ -20,38 +20,90 @@ from torch.utils.data import DataLoader, Dataset
 # ==========================================
 # GT HEATMAP GENERATION
 # ==========================================
+def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0,
+                        n_seeds: int = 50) -> np.ndarray:
+    """Build ground-truth seed heatmap using coverage-based farthest-point sampling.
 
-
-def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0) -> np.ndarray:
-    """Build ground-truth seed heatmap for one image.
-    Places a Gaussian blob (sigma=3px) at every endpoint and junction
-    of the GT centerline skeleton.
+    Instead of placing blobs at every endpoint and junction (which produces
+    500+ densely clustered targets), this selects ~n_seeds points that are
+    maximally spread along the vessel tree. The seed detector then learns
+    to predict good starting points for tracing, not topological features.
 
     Args:
         centerline: binary centerline mask (H, W), float32
-        sigma:      Gaussian sigma in pixels
+        sigma:      Gaussian blob radius in pixels
+        n_seeds:    number of seed points to place
 
     Returns:
         heatmap (H, W), float32, normalised to [0, 1]
-
     """
     from scipy.ndimage import gaussian_filter
 
-    from data.centerline_extraction import CenterlineExtractor
+    points = np.argwhere(centerline > 0)
+    if len(points) == 0:
+        return np.zeros_like(centerline, dtype=np.float32)
 
-    extractor = CenterlineExtractor()
-    endpoints = extractor._find_endpoints(centerline)
-    junctions = extractor._find_junctions(centerline)
+    # Farthest-point sampling for maximum coverage
+    n_seeds = min(n_seeds, len(points))
+    h, w = centerline.shape
 
+    # First seed: closest to image center
+    center = np.array([h / 2, w / 2])
+    dists_to_center = np.linalg.norm(points - center, axis=1)
+    seeds = [points[np.argmin(dists_to_center)]]
+
+    # Remaining seeds: each maximally far from all existing seeds
+    min_dists = np.full(len(points), np.inf)
+    for _ in range(n_seeds - 1):
+        # Update minimum distance to nearest existing seed
+        last_seed = seeds[-1]
+        d = np.linalg.norm(points - last_seed, axis=1)
+        min_dists = np.minimum(min_dists, d)
+
+        seeds.append(points[np.argmax(min_dists)])
+
+    # Place Gaussian blobs at each seed
     heatmap = np.zeros_like(centerline, dtype=np.float32)
-    for y, x in endpoints + junctions:
-        if 0 <= y < heatmap.shape[0] and 0 <= x < heatmap.shape[1]:
+    for y, x in seeds:
+        if 0 <= y < h and 0 <= x < w:
             heatmap[y, x] = 1.0
 
     heatmap = gaussian_filter(heatmap, sigma=sigma)
     if heatmap.max() > 0:
         heatmap /= heatmap.max()
+
     return heatmap
+
+# def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+#     """Build ground-truth seed heatmap for one image.
+#     Places a Gaussian blob (sigma=3px) at every endpoint and junction
+#     of the GT centerline skeleton.
+
+#     Args:
+#         centerline: binary centerline mask (H, W), float32
+#         sigma:      Gaussian sigma in pixels
+
+#     Returns:
+#         heatmap (H, W), float32, normalised to [0, 1]
+
+#     """
+#     from scipy.ndimage import gaussian_filter
+
+#     from data.centerline_extraction import CenterlineExtractor
+
+#     extractor = CenterlineExtractor()
+#     endpoints = extractor._find_endpoints(centerline)
+#     junctions = extractor._find_junctions(centerline)
+
+#     heatmap = np.zeros_like(centerline, dtype=np.float32)
+#     for y, x in endpoints + junctions:
+#         if 0 <= y < heatmap.shape[0] and 0 <= x < heatmap.shape[1]:
+#             heatmap[y, x] = 1.0
+
+#     heatmap = gaussian_filter(heatmap, sigma=sigma)
+#     if heatmap.max() > 0:
+#         heatmap /= heatmap.max()
+#     return heatmap
 
 
 # ==========================================
