@@ -1,4 +1,5 @@
-"""run_frangi.py
+"""
+run_frangi.py
 =========================
 Frangi Vesselness Baseline — dataset-agnostic.
 
@@ -24,10 +25,8 @@ from data.dataloader import TEST_DATASETS, get_test_data
 from evaluation.metrics import CenterlineMetrics
 
 # ==========================================
-# CONFIG — change these to switch dataset
+# METRIC SETTINGS
 # ==========================================
-
-# Standardised metric columns — shared across all baseline scripts
 METRIC_COLS = [
     "iou",
     "clDice",
@@ -49,20 +48,21 @@ METRIC_COLS = [
 # ==========================================
 FRANGI_PARAMS = {
     "AV-WIDE": dict(
-        sigma_min=1.5,
-        sigma_max=8.0,
-        num_scales=8,
-        threshold=0.02,
-        gauss_sigma=1.5,
-        min_size=100,
-    ),
-    "DRHAGIS": dict(
         sigma_min=1.0,
-        sigma_max=5.0,
-        num_scales=6,
-        threshold=0.03,
-        gauss_sigma=1.0,
-        min_size=50,
+        sigma_max=8.0,
+        num_scales=10,
+        threshold=0.005,
+        gauss_sigma=1.2,
+        min_size=75,
+    ),
+    
+    "DRHAGIS": dict(
+        sigma_min=0.5,     
+        sigma_max=4.0,     
+        num_scales=10,     
+        threshold=0.004,   
+        gauss_sigma=1.0,   
+        min_size=100,       
     ),
 }
 
