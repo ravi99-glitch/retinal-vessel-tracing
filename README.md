@@ -57,3 +57,6 @@ All methods are evaluated using the same metric suite:
 | Betti-0 error | Connected component count difference |
 
 Results are saved as per-image CSVs and summary tables under `results/`.
+
+---
+*This document was created with assistance from AI tools. The content has been reviewed and edited by the project author.*
