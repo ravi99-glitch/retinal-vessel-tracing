@@ -1,31 +1,92 @@
-# Policy-Based Skeleton Tracing for Retinal Blood Vessels
+# Retinal Vessel Tracing
 
-An RL-based approach to extract vessel centerlines from retinal fundus images.
+Reinforcement learning agent for retinal vessel centerline extraction, benchmarked against classical and CNN baselines on multi-dataset evaluation.
 
 ## Overview
 
-This project implements a reinforcement learning agent that traces blood vessel centerlines in retinal photographs. Instead of using traditional segmentation + post-processing, the agent learns to navigate through vessels, producing connected skeletons by construction.
+This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along vessel structures using a policy trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, enabling fully end-to-end inference without ground-truth dependencies.
 
-### Key Features
+Three baselines provide comparison: a Frangi vesselness filter, a greedy tracing heuristic, and a UNet CNN.
 
-- **RL-based tracing**: PPO agent with CNN encoder and optional LSTM for temporal context
-- **Tolerance-aware rewards**: Smooth rewards based on distance to ground truth centerlines
-- **Seed detection**: CNN-based detection of endpoints and junctions for trace initialization
-- **Frontier-based coverage**: Strategy to cover all branches while maintaining connectivity
-- **Curriculum learning**: Progressive difficulty increase during training
-- **Comprehensive evaluation**: Multiple metrics including F1@τ, clDice, and topology measures
+## Pipeline
 
-## Installation
+```
+                    ┌─────────────────────────────────────┐
+                    │         Training (5 datasets)        │
+                    │   DRIVE · STARE · CHASE_DB1 · HRF   │
+                    │              · LES-AV                │
+                    └──────────────────┬──────────────────┘
+                                       │
+            ┌──────────────────────────┼──────────────────────────┐
+            │                          │                          │
+     ┌──────▼──────┐          ┌───────▼────────┐         ┌──────▼──────┐
+     │  UNet CNN   │          │  Seed Detector  │         │  Imitation  │
+     │  Baseline   │          │   (heatmap)     │         │  Learning   │
+     └──────┬──────┘          └───────┬────────┘         └──────┬──────┘
+            │                         │                         │
+            │                         │                  ┌──────▼──────┐
+            │                         │                  │     PPO     │
+            │                         │                  │ Fine-tuning │
+            │                         │                  └──────┬──────┘
+            │                         │                         │
+            │                  ┌──────▼─────────────────────────▼──────┐
+            │                  │        End-to-End Inference           │
+            │                  │  Seeds → Frontier Tracer → Skeleton   │
+            │                  └──────────────────┬───────────────────┘
+            │                                     │
+            └──────────────┬──────────────────────┘
+                           │
+                    ┌──────▼──────────────────────────────┐
+                    │        Evaluation (2 datasets)       │
+                    │         AV-WIDE · DR_HAGIS           │
+                    └─────────────────────────────────────┘
+```
 
-```bash
-# Clone repository
-git clone https://github.com/yourusername/vessel-tracing.git
-cd vessel-tracing
+## Datasets
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+Training and validation use a balanced combination of five datasets. Testing uses two held-out external datasets the models never see during training.
 
-# Install dependencies
-pip install -r requirements.txt
+| Split | Datasets | Purpose |
+|-------|----------|---------|
+| Train / Val | DRIVE, STARE, CHASE_DB1, HRF, LES-AV | Model training with weighted sampling for balance |
+| Test | AV-WIDE, DR_HAGIS | Generalization evaluation on unseen data |
+
+
+## Methods
+
+### Baselines
+
+**Frangi filter** — Multi-scale Hessian-based vesselness enhancement followed by thresholding and skeletonization. Scale parameters are tuned per test dataset.
+
+**Greedy tracer** — Seeds placed at local vesselness maxima, traces grown greedily along ridges, then skeletonized and pruned.
+
+**UNet CNN** — Lightweight UNet (DSConv blocks, ~0.5M params) trained on CLAHE-preprocessed grayscale images to predict vessel centerline probability maps.
+
+### RL Agent
+
+The RL agent treats centerline extraction as sequential decision-making. At each step, the agent observes a local 65×65 patch and chooses one of 8 movement directions.
+
+**Training pipeline:**
+1. **Seed detector** — UNet trained to predict a heatmap of vessel endpoints and junctions
+2. **Imitation learning** — Policy initialized by supervised learning on expert traces derived from ground-truth centerlines
+3. **PPO fine-tuning** — Policy refined with proximal policy optimization using a shaped reward combining coverage, proximity, and topology signals
+
+**Inference:**
+1. Seed detector predicts starting points from the input image
+2. Frontier tracer sequentially launches the RL agent from each seed
+3. Individual traces are merged into a single skeleton
+
+## Metrics
+
+All methods are evaluated using the same metric suite:
+
+| Metric | What it measures |
+|--------|-----------------|
+| F1 @ 1/2/3 px | Tolerance-aware centerline matching |
+| Precision / Recall | Directional centerline accuracy |
+| clDice | Topology-aware volumetric overlap |
+| IoU | Binary segmentation overlap |
+| HD95 | 95th percentile Hausdorff distance |
+| Betti-0 error | Connected component count difference |
+
+Results are saved as per-image CSVs and summary tables under `results/`.
