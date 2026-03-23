@@ -1,53 +1,17 @@
 # Retinal Vessel Tracing
 
-Reinforcement learning agent for retinal vessel centerline extraction, benchmarked against classical and CNN baselines on multi-dataset evaluation.
-
-https://lh3.googleusercontent.com/gg-dl/AOI_d_94oYbSiWvFT7jEjhTndeYyr04ruPV6idSVyb8K_lWQmZ-pa55r2jl6clEyXw3z-TEM5IN7M9mDM6QUrgWBB0NHJ4X9OtOf6RP1uGtgydZhds4F-uSgGKmhQcpGChhzWXRUItwpabOWOfgHwjNNQzEIIAvmCVop8aHtJ2GlxzgLsRUtag=s1600-rj<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/87c0fda4-7538-4bab-a92c-c2e2b03eb715" />
-
+A reinforcement learning agent for extracting the centerline of retinal blood vessels. The agent was compared against classical and CNN baseline models using multiple datasets.
 
 ## Overview
 
-This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along vessel structures using a policy trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, enabling fully end-to-end inference without ground-truth dependencies.
+This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along blood vessel structures using a policy, trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, allowing for end-to-end inference without the need for ground-truth labels.
 
-Three baselines provide comparison: a Frangi vesselness filter, a greedy tracing heuristic, and a UNet CNN.
+The agent was compared against three baseline models: a Frangi vesselness filter, a greedy tracing heuristic, and a UNet CNN.
 
-## Pipeline
-
-```
-                    ┌─────────────────────────────────────┐
-                    │         Training (5 datasets)        │
-                    │   DRIVE · STARE · CHASE_DB1 · HRF   │
-                    │              · LES-AV                │
-                    └──────────────────┬──────────────────┘
-                                       │
-            ┌──────────────────────────┼──────────────────────────┐
-            │                          │                          │
-     ┌──────▼──────┐          ┌───────▼────────┐         ┌──────▼──────┐
-     │  UNet CNN   │          │  Seed Detector  │         │  Imitation  │
-     │  Baseline   │          │   (heatmap)     │         │  Learning   │
-     └──────┬──────┘          └───────┬────────┘         └──────┬──────┘
-            │                         │                         │
-            │                         │                  ┌──────▼──────┐
-            │                         │                  │     PPO     │
-            │                         │                  │ Fine-tuning │
-            │                         │                  └──────┬──────┘
-            │                         │                         │
-            │                  ┌──────▼─────────────────────────▼──────┐
-            │                  │        End-to-End Inference           │
-            │                  │  Seeds → Frontier Tracer → Skeleton   │
-            │                  └──────────────────┬───────────────────┘
-            │                                     │
-            └──────────────┬──────────────────────┘
-                           │
-                    ┌──────▼──────────────────────────────┐
-                    │        Evaluation (2 datasets)       │
-                    │         AV-WIDE · DR_HAGIS           │
-                    └─────────────────────────────────────┘
-```
 
 ## Datasets
 
-Training and validation use a balanced combination of five datasets. Testing uses two held-out external datasets the models never see during training.
+Training and validation use a balanced combination of five datasets. Testing uses two external datasets the models never see during training.
 
 | Split | Datasets | Purpose |
 |-------|----------|---------|
@@ -57,13 +21,13 @@ Training and validation use a balanced combination of five datasets. Testing use
 
 ## Methods
 
-### Baselines
+### Baseline Models
 
 **Frangi filter** — Multi-scale Hessian-based vesselness enhancement followed by thresholding and skeletonization. Scale parameters are tuned per test dataset.
 
 **Greedy tracer** — Seeds placed at local vesselness maxima, traces grown greedily along ridges, then skeletonized and pruned.
 
-**UNet CNN** — Lightweight UNet (DSConv blocks, ~0.5M params) trained on CLAHE-preprocessed grayscale images to predict vessel centerline probability maps.
+**UNet CNN** — Lightweight UNet trained on CLAHE-preprocessed grayscale images to predict vessel centerline probability maps.
 
 ### RL Agent
 
