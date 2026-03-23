@@ -284,7 +284,7 @@ def trace_gt_mode(ppo_model, sample):
 # ==========================================
 
 
-def trace_e2e_mode(ppo_model, seed_model, sample):
+def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
     img_t = (
         torch.from_numpy(sample["image"].transpose(2, 0, 1))
         .unsqueeze(0)
