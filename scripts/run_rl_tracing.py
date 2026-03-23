@@ -10,7 +10,6 @@ import sys
 import cv2
 import matplotlib
 import numpy as np
-import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -526,6 +525,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
         if dataset_name == "val":
             from data.dataloader import get_data
             ds, _ = get_data("rl_agent", "val", tolerance=TOLERANCE, resize=(512, 512))
+            no_fov = False
             samples = {}
             for i in range(len(ds)):
                 s = ds[i]
@@ -569,6 +569,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
                     print(f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
             print("=" * 65)
 
+            import pandas as pd
             summary_rows = [
                 {
                     "Metric": k,
