@@ -9,7 +9,7 @@ Workflow:
   3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
   4. Greedy steepest-ascent tracing from local maxima seeds.
   5. Post-trace object removal for noise cleanup.
-  6. SKAN Pruning (New): Graph-based removal of spurious tips.
+  6. SKAN Pruning: Graph-based removal of spurious tips.
 ==================
 """
 
