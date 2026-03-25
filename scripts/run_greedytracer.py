@@ -48,26 +48,26 @@ METRIC_COLS = [
 GREEDY_PARAMS = {
     "AV-WIDE": dict(
         sigma_min=0.5,
-        sigma_max=3.0,
-        num_scales=5,
-        gauss_sigma=1.5,
-        seed_thresh=0.25,
-        step_thresh=0.15,
-        min_length=15,
+        sigma_max=2.5,          
+        num_scales=5,           
+        gauss_sigma=1.0,        
+        seed_thresh=0.1727,     
+        step_thresh=0.0909,     
+        min_length=10.0,        
         thin_output=True,
         min_obj_size=0,
     ),
     
     "DRHAGIS": dict(
-        sigma_min=0.5,      # Adjusted for potentially smaller vessels
-        sigma_max=4.0,      
-        num_scales=8,       
-        gauss_sigma=1.2,    
-        seed_thresh=0.30,   # Higher threshold to ignore pathology noise
-        step_thresh=0.12,   
-        min_length=25,      # Longer minimum length to filter out noise fragments
+        sigma_min=0.5,
+        sigma_max=2.5,          
+        num_scales=5,           
+        gauss_sigma=0.8,        
+        seed_thresh=0.4,        
+        step_thresh=0.1891,     
+        min_length=10.0,        
         thin_output=True,
-        min_obj_size=50,    
+        min_obj_size=50,        
     ),
 }
 
