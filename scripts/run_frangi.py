@@ -47,7 +47,7 @@ METRIC_COLS = [
 # PER-DATASET FRANGI PARAMETERS
 # ==========================================
 FRANGI_PARAMS = {
-    "AV-WIDE": dict(
+    "DRIVE": dict(
         sigma_min=1.0,
         sigma_max=8.0,
         num_scales=10,
@@ -98,9 +98,9 @@ def evaluate(dataset_name):
         image_id = sample["id"]
 
         pred_skeleton, vesselness, _ = model.extract_centerline(
-            sample["image"],
+            sample["preprocessed"],
             return_vesselness=True,
-            external_fov_mask=sample["fov_mask"],
+            fov_mask=sample["fov_mask"],
         )
 
         fov_mask_bool = sample["fov_mask"] > 128
