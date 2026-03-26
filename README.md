@@ -15,8 +15,8 @@ Training and validation use a balanced combination of five datasets. Testing use
 
 | Split | Datasets | Purpose |
 |-------|----------|---------|
-| Train / Val | DRIVE, STARE, CHASE_DB1, HRF, LES-AV | Model training with weighted sampling for balance |
-| Test | AV-WIDE, DR_HAGIS | Generalization evaluation on unseen data |
+| Train / Val | FIVES, STARE, CHASE_DB1, HRF, LES-AV | Model training with weighted sampling for balance |
+| Test | DRIVE, DR_HAGIS | Generalization evaluation on unseen data |
 
 
 ## Methods
