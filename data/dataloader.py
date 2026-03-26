@@ -90,7 +90,6 @@ class DatasetConfig:
     vessel_suffix: str
     mask_dir: Optional[str] = None
     mask_suffix: Optional[str] = None
-    no_fov: bool = False
     stem_rule: Optional[str] = None
     train_subdir: Optional[str] = None
 
@@ -151,13 +150,6 @@ DATASET_REGISTRY: Dict[str, DatasetConfig] = {
         mask_dir="masks",
         mask_suffix="_mask.gif",
     ),
-    "AV-WIDE": DatasetConfig(
-        image_dir="images",
-        vessel_dir="manual",
-        image_glob="*.png",
-        vessel_suffix="_vessels.png",
-        no_fov=True,
-    ),
     "DRHAGIS": DatasetConfig(
         image_dir="Fundus_Images",
         vessel_dir="Manual_Segmentations",
@@ -176,8 +168,8 @@ DATASET_REGISTRY: Dict[str, DatasetConfig] = {
 }
 
 
-TRAIN_DATASETS = ("DRIVE", "STARE", "CHASEDB1", "HRF", "LES-AV")
-TEST_DATASETS = ("AV-WIDE", "DRHAGIS")
+TRAIN_DATASETS = ("FIVES", "STARE", "CHASEDB1", "HRF", "LES-AV")
+TEST_DATASETS = ("DRIVE", "DRHAGIS")
 VALID_TARGETS = ("unet", "frangi", "greedy_tracer", "rl_agent")
 
 
@@ -221,7 +213,7 @@ class RetinalFundusDataset(Dataset):
         tolerance: float = 2.0,
         cache_centerlines: bool = True,
         transform=None,
-        preprocessor: Optional[FundusPreprocessor] = None,
+        fundus_preprocessor: Optional[FundusPreprocessor] = None,
         centerline_extractor: Optional[CenterlineExtractor] = None,
     ):
         if target not in VALID_TARGETS:
@@ -239,7 +231,7 @@ class RetinalFundusDataset(Dataset):
         self.resize = resize
         self.tolerance = tolerance
         self.transform = transform
-        self.preprocessor = preprocessor or FundusPreprocessor()
+        self.fundus_preprocessor = fundus_preprocessor or FundusPreprocessor()
         self.cl_extractor = centerline_extractor or CenterlineExtractor()
 
         # Resolve root directory
@@ -353,23 +345,14 @@ class RetinalFundusDataset(Dataset):
         return cl
 
     # -- FOV mask ----------------------------------------------------------
+
     def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
         if "mask" in sample:
             return self._load_fov(sample["mask"])
-        if self.cfg.no_fov:
-            return np.ones(rgb.shape[:2], dtype=np.uint8) * 255
-        green = self.preprocessor.extract_green_channel(rgb)
+        green = self.fundus_preprocessor.extract_green_channel(rgb)
         if green.dtype != np.uint8:
             green = np.clip(green * 255, 0, 255).astype(np.uint8)
-        return self.preprocessor.create_fov_mask(green)
-
-    # def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
-    #     if "mask" in sample:
-    #         return self._load_fov(sample["mask"])
-    #     green = self.preprocessor.extract_green_channel(rgb)
-    #     if green.dtype != np.uint8:
-    #         green = np.clip(green * 255, 0, 255).astype(np.uint8)
-    #     return self.preprocessor.create_fov_mask(green)
+        return self.fundus_preprocessor.create_fov_mask(green)
 
     # -- Resize ------------------------------------------------------------
     def _maybe_resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
@@ -453,7 +436,7 @@ class RetinalFundusDataset(Dataset):
         self, sid: str, rgb: np.ndarray, vessel: np.ndarray, fov: np.ndarray
     ) -> Dict[str, Any]:
         ext_mask = fov if fov.max() > 0 else None
-        preprocessed = self.preprocessor.preprocess(rgb, external_mask=ext_mask)
+        preprocessed = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         cl = self._get_centerline(sid, vessel)
         fov_f = (fov > 0).astype(np.float32)
 
@@ -476,13 +459,14 @@ class RetinalFundusDataset(Dataset):
             "fov_mask": torch.from_numpy(fov_f).unsqueeze(0).float(),
         }
 
-    def _fmt_frangi(
-        self, sid: str, rgb: np.ndarray, vessel: np.ndarray, fov: np.ndarray
-    ) -> Dict[str, Any]:
+    def _fmt_frangi(self, sid, rgb, vessel, fov):
+        ext_mask = fov if fov.max() > 0 else None
+        preprocessed = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         cl = self._get_centerline(sid, vessel)
         return {
             "id": sid,
-            "image": rgb,
+            "image": rgb,                                      
+            "preprocessed": preprocessed,                     
             "vessel_mask": (vessel * 255).astype(np.uint8),
             "centerline": (cl * 255).astype(np.uint8),
             "fov_mask": fov,
@@ -500,7 +484,7 @@ class RetinalFundusDataset(Dataset):
         img_orig = img_f.copy()
 
         ext_mask = fov if fov.max() > 0 else None
-        enhanced_green = self.preprocessor.preprocess(rgb, external_mask=ext_mask)
+        enhanced_green = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         img_f[:, :, 1] = enhanced_green
 
         cl = self._get_centerline(sid, vessel)
@@ -555,7 +539,7 @@ def get_data(
     if split not in ("train", "val"):
         raise ValueError(f"split must be 'train' or 'val', got '{split}'")
 
-    shared_pre = kwargs.pop("preprocessor", None) or FundusPreprocessor()
+    shared_pre = kwargs.pop("fundus_preprocessor", None) or FundusPreprocessor()
     shared_ext = kwargs.pop("centerline_extractor", None) or CenterlineExtractor()
 
     sub_datasets: List[RetinalFundusDataset] = []
@@ -573,7 +557,7 @@ def get_data(
                 split=split,
                 train_frac=train_frac,
                 resize=resize,
-                preprocessor=shared_pre,
+                fundus_preprocessor=shared_pre,
                 centerline_extractor=shared_ext,
                 **kwargs,
             )
