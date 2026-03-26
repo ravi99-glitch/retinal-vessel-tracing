@@ -3,10 +3,10 @@
 Datasets
 --------
 Training / validation (combined, balanced):
-    DRIVE, STARE, CHASE_DB1, HRF, LES_AV
+    FIVES, STARE, CHASE_DB1, HRF, LES_AV
 
 External test (used in full, no split):
-    AV_WIDE, DR_HAGIS
+    DRIVE, DR_HAGIS
 
 Supported targets
 -----------------
