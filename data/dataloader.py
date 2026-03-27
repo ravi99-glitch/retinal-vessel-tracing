@@ -57,6 +57,8 @@ _PROJECT_ROOT = _DATA_BASE.parent
 WEIGHTS_DIR = _PROJECT_ROOT / "weights"
 OUTPUT_DIR = _PROJECT_ROOT / "results"
 
+MAX_SAMPLES = 5
+
 
 def get_root(dataset_name: str) -> Path:
     """Return the root directory for a dataset."""
@@ -215,6 +217,7 @@ class RetinalFundusDataset(Dataset):
         transform=None,
         fundus_preprocessor: Optional[FundusPreprocessor] = None,
         centerline_extractor: Optional[CenterlineExtractor] = None,
+        max_samples: Optional[int] = None,  
     ):
         if target not in VALID_TARGETS:
             raise ValueError(f"target must be one of {VALID_TARGETS}, got '{target}'")
@@ -241,6 +244,10 @@ class RetinalFundusDataset(Dataset):
         self.samples = self._discover_samples()
         if split is not None:
             self.samples = self._apply_split(self.samples, split, train_frac)
+
+        # Cap samples
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
 
         if not self.samples:
             raise FileNotFoundError(
@@ -390,23 +397,6 @@ class RetinalFundusDataset(Dataset):
             out.append(padded)
 
         return tuple(out)
-    
-    # def _maybe_resize(
-    #     self, *arrays: np.ndarray, interp: Optional[List[int]] = None
-    # ) -> Tuple[np.ndarray, ...]:
-    #     if self.resize is None:
-    #         return arrays
-    #     h, w = self.resize
-    #     out = []
-    #     for i, arr in enumerate(arrays):
-    #         if interp is not None and i < len(interp):
-    #             flag = interp[i]
-    #         elif arr.ndim == 2:
-    #             flag = cv2.INTER_NEAREST
-    #         else:
-    #             flag = cv2.INTER_LINEAR
-    #         out.append(cv2.resize(arr, (w, h), interpolation=flag))
-    #     return tuple(out)
 
     # -- __len__ / __getitem__ ---------------------------------------------
     def __len__(self) -> int:
@@ -513,6 +503,7 @@ def get_data(
     resize: Tuple[int, int] = (512, 512),
     train_frac: float = 0.8,
     balance: bool = True,
+    max_samples_per_dataset: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[ConcatDataset, DataLoader]:
     """Load the combined train/val set (DRIVE + STARE + CHASE_DB1 + HRF + LES_AV).
@@ -559,6 +550,7 @@ def get_data(
                 resize=resize,
                 fundus_preprocessor=shared_pre,
                 centerline_extractor=shared_ext,
+                max_samples=max_samples_per_dataset,
                 **kwargs,
             )
             sub_datasets.append(ds)
@@ -608,6 +600,7 @@ def get_test_data(
     batch_size: int = 1,
     num_workers: int = 0,
     resize: Optional[Tuple[int, int]] = (512, 512),
+    max_samples: Optional[int] = MAX_SAMPLES, 
     **kwargs,
 ) -> Tuple[RetinalFundusDataset, DataLoader]:
     """Load an external test dataset in full (no split).
@@ -633,6 +626,7 @@ def get_test_data(
         target=target,
         split=None,
         resize=resize,
+        max_samples=max_samples, 
         **kwargs,
     )
     collate_fn = _list_collate if target in ("frangi", "greedy_tracer") else None
