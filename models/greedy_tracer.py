@@ -1,6 +1,5 @@
-# greedy_tracer.py
-"""
-==================
+# greedy_tracer_baseline.py
+"""==================
 Greedy Tracer Baseline for Vessel Extraction
 
 Workflow:
@@ -9,7 +8,7 @@ Workflow:
   3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
   4. Greedy steepest-ascent tracing from local maxima seeds.
   5. Post-trace object removal for noise cleanup.
-  6. SKAN Pruning: Graph-based removal of spurious tips.
+  6. SKAN Pruning : Graph-based removal of spurious tips.
 ==================
 """
 
@@ -21,8 +20,6 @@ from skan import Skeleton as SkanSkeleton
 from skan import summarize
 from skimage import filters
 from skimage.morphology import remove_small_objects, skeletonize
-
-from data.fundus_preprocessor import FundusPreprocessor
 
 # ==========================================
 # TRAJECTORY-RECORDING GREEDY TRACER
@@ -229,9 +226,7 @@ class GreedyTracerBaseline:
         self.sigma_max = sigma_max
         self.num_scales = num_scales
         self.gauss_sigma = gauss_sigma
-        self.min_obj_size = min_obj_size  # lives here, NOT in GreedyTracer
-
-        self.preprocessor = FundusPreprocessor()
+        self.min_obj_size = min_obj_size
 
         self.tracer = GreedyTracer(
             seed_thresh=seed_thresh,
@@ -273,48 +268,24 @@ class GreedyTracerBaseline:
 
         return vesselness.astype(np.float32)
 
+
+    # Change extract_centerline signature:
     def extract_centerline(
         self,
-        image: np.ndarray,
-        external_fov_mask: Optional[np.ndarray] = None,
+        preprocessed: np.ndarray,
+        fov_mask: Optional[np.ndarray] = None,
         return_vesselness: bool = False,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
         """Args:
-            image             : (H, W, 3) RGB uint8 fundus image
-            external_fov_mask : (H, W) uint8 FOV mask, or None for auto-detection
-            return_vesselness : if True, also return the vesselness map
-
-        Returns:
-            skeleton          : (H, W) uint8 binary centerline {0, 255}
-            vesselness        : (H, W) float32 [0,1], or None
-            traces            : list of paths for trajectory visualization
-                                each path = ordered list of (r, c) tuples
-                                sorted by visit order (strongest vessel first)
-
+            preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
+            fov_mask          : (H, W) uint8 FOV mask {0, 255}
         """
-        # 1. Preprocessing
-        preprocessed, _, _, _, mask = self.preprocessor.preprocess(
-            image,
-            external_mask=external_fov_mask,
-            return_intermediate=True,
-        )
-
-        # 2. Frangi vesselness + Gaussian smoothing + Eroded FOV masking
+        mask = fov_mask if fov_mask is not None else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
         vesselness = self._compute_vesselness(preprocessed, mask)
-
-        # 3. Greedy tracing — returns skeleton + full trajectory data
-        # Note: We pass the UNERODED mask here so the trace can still reach
-        # the real edges of the vessels, but the vesselness map itself
-        # already has the halo zeroed out.
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
-        # 4. Remove isolated small blobs (post-trace noise cleanup)
-        #    Kills scattered false-positive dots without hard thresholding.
-        #    min_obj_size=0 disables this step entirely.
         if skeleton.any() and self.min_obj_size > 0:
-            skeleton_bool = remove_small_objects(
-                skeleton > 0, min_size=self.min_obj_size
-            )
+            skeleton_bool = remove_small_objects(skeleton > 0, min_size=self.min_obj_size)
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         if return_vesselness:

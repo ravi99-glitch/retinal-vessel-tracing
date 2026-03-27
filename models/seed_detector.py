@@ -1,6 +1,5 @@
-# seed_detector.py
-"""
-Seed detector — predicts a sparse heatmap of vessel endpoints and junctions.
+# models/seed_detector.py
+"""Seed detector — predicts a sparse heatmap of vessel endpoints and junctions.
 
 Architecture: CenterlineUNet (same as baseline, see centerline_unet_baseline.py)
   - Depthwise-separable convolutions (~0.5M params)
