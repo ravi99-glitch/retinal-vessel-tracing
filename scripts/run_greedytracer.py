@@ -46,7 +46,7 @@ METRIC_COLS = [
 # PER-DATASET GREEDY PARAMETERS
 # ==========================================
 GREEDY_PARAMS = {
-    "AV-WIDE": dict(
+    "DRIVE": dict(
         sigma_min=0.5,
         sigma_max=2.5,          
         num_scales=5,           
@@ -140,7 +140,8 @@ def save_standard_panel(
     plt.close()
 
 def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir, dataset_name=""):
-    if len(traces) == 0: return
+    if len(traces) == 0: 
+        return
 
     fov_bin = (mask > 0).astype(np.float32)
     vessel_bg = vesselness * fov_bin
@@ -213,7 +214,7 @@ def evaluate(dataset_name):
         gt_skel = (skeletonize(vessel_mask > 128) * 255).astype(np.uint8)
 
         pred_skel, vesselness, traces = model.extract_centerline(
-            img_rgb, external_fov_mask=fov_mask, return_vesselness=True,
+            sample["preprocessed"], fov_mask=fov_mask, return_vesselness=True,
         )
 
         res = metrics_fn.compute_all_metrics(

@@ -1,8 +1,9 @@
-# scripts/train_ppo.py
 """PPO Training — Step 2 of 2. Run AFTER train_imitation.py.
 
-All PPO logic lives in rl_training/ppo.py.
+All PPO logic lives in training/ppo.py.
 This script handles: paths, config, and data loading via the unified dataloader.
+
+Supports both feedforward and LSTM policies via CONFIG["policy"]["use_lstm"].
 """
 
 import os
@@ -28,6 +29,7 @@ TOLERANCE = 2.0
 OBS_SIZE = 65
 MAX_STEPS = 2000
 USE_VESSELNESS = False
+LSTM_CHUNK_LENGTH = 32
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -35,7 +37,7 @@ CONFIG = {
     "policy": {
         "hidden_dim": 128,
         "lstm_hidden": 128,
-        "use_lstm": False,
+        "use_lstm": True,
         "dropout": 0.05,
         "encoder_type": "cnn",
     },
@@ -104,7 +106,9 @@ def load_samples(split: str) -> List[Dict]:
 
 
 def main():
+    use_lstm = CONFIG["policy"]["use_lstm"]
     print(f"Device: {DEVICE}")
+    print(f"LSTM:   {'ON chunk_len=' + str(LSTM_CHUNK_LENGTH) if use_lstm else 'OFF'}")
 
     train_samples = load_samples("train")
     val_samples = load_samples("val")
@@ -132,6 +136,7 @@ def main():
         eval_every=25,
         save_every=50,
         tolerance=TOLERANCE,
+        lstm_chunk_length=LSTM_CHUNK_LENGTH,
     )
 
     trainer.train(

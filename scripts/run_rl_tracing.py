@@ -21,7 +21,7 @@ from skimage.morphology import skeletonize
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
-from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_test_data
+from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_test_data, get_data
 from evaluation.metrics import CenterlineMetrics
 from environment.frontier_tracer import FrontierTracer
 from environment.seeding_utils import merge_seeds
@@ -88,7 +88,7 @@ PPO_CONFIG = {
     "policy": {
         "hidden_dim": 128,
         "lstm_hidden": 128,
-        "use_lstm": False,
+        "use_lstm": True,
         "dropout": 0.0,
         "encoder_type": "cnn",
     },
@@ -127,11 +127,7 @@ SEED_CONFIG = {
 # DATA LOADING
 # ==========================================
 def _load_all_samples(dataset_name):
-    from data.dataloader import DATASET_REGISTRY
     ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
-    cfg = DATASET_REGISTRY.get(dataset_name.upper(), None)
-    no_fov = cfg.no_fov if cfg else False
-
     samples = {}
     for i in range(len(ds)):
         s = ds[i]
@@ -144,23 +140,7 @@ def _load_all_samples(dataset_name):
             "distance_transform": s["distance_transform"].squeeze(0).numpy(),
             "fov_mask": s["fov_mask"].squeeze(0).numpy(),
         }
-    return samples, no_fov
-
-# def _load_all_samples(dataset_name):
-#     ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
-#     samples = {}
-#     for i in range(len(ds)):
-#         s = ds[i]
-#         samples[s["id"]] = {
-#             "id": s["id"],
-#             "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
-#             "image": s["image"].permute(1, 2, 0).numpy(),
-#             "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
-#             "centerline": s["centerline"].squeeze(0).numpy(),
-#             "distance_transform": s["distance_transform"].squeeze(0).numpy(),
-#             "fov_mask": s["fov_mask"].squeeze(0).numpy(),
-#         }
-#     return samples
+    return samples
 
 
 # ==========================================
@@ -310,25 +290,15 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
         tqdm.write("    WARNING: No seeds found, falling back to image centre")
         h, w = sample["image"].shape[:2]
         seeds = [(h // 2, w // 2, 0.5)]
-    
-    n_ring = 0 if no_fov else N_RING_SEEDS
+
     merged, n_ring_added = merge_seeds(
         detector_seeds=seeds,
         fov_mask=sample["fov_mask"],
         max_traces=MAX_TRACES,
-        n_ring_seeds=n_ring,
+        n_ring_seeds=N_RING_SEEDS,
         inset_px=RING_INSET_PX,
         obs_half=OBS_SIZE // 2,
     )
-
-    # merged, n_ring_added = merge_seeds(
-    #     detector_seeds=seeds,
-    #     fov_mask=sample["fov_mask"],
-    #     max_traces=MAX_TRACES,
-    #     n_ring_seeds=N_RING_SEEDS,
-    #     inset_px=RING_INSET_PX,
-    #     obs_half=OBS_SIZE // 2,
-    # )
     tqdm.write(
         f"    Detector seeds (capped): {MAX_TRACES - N_RING_SEEDS}  "
         f"Ring seeds added: {n_ring_added}  "
@@ -364,14 +334,14 @@ def make_overlay(image_orig, gt_centerline, traced, paths):
     return overlay
 
 
-def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
+def visualize_sample(ppo_model, seed_model, sample, output_dir):
     img_id = sample["id"]
     tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE}]")
 
     if MODE == "gt":
         traced, paths = trace_gt_mode(ppo_model, sample)
     else:
-        traced, paths = trace_e2e_mode(ppo_model, seed_model, sample, no_fov=no_fov)
+        traced, paths = trace_e2e_mode(ppo_model, seed_model, sample)
 
     pred_skel = (traced > 0).astype(np.uint8)
     gt_skel = (sample["centerline"] > 0).astype(np.uint8)
@@ -523,9 +493,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
     for dataset_name in dataset_names:
         # Load data
         if dataset_name == "val":
-            from data.dataloader import get_data
             ds, _ = get_data("rl_agent", "val", tolerance=TOLERANCE, resize=(512, 512))
-            no_fov = False
             samples = {}
             for i in range(len(ds)):
                 s = ds[i]
@@ -539,7 +507,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
                     "fov_mask": s["fov_mask"].squeeze(0).numpy(),
                 }
         else:
-            samples, no_fov = _load_all_samples(dataset_name)
+            samples = _load_all_samples(dataset_name)
 
         output_dir = str(_OUTPUT_BASE / f"RL_tracing_{MODE}" / dataset_name)
         os.makedirs(output_dir, exist_ok=True)
@@ -554,7 +522,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
             samples.keys(), desc=f"RL Tracing — {dataset_name}", unit="img"
         ):
             sample = samples[img_id]
-            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=no_fov)
+            metrics = visualize_sample(ppo_model, seed_model, sample, output_dir)
             append_csv(csv_path, metrics)
             all_metrics.append(metrics)
 
