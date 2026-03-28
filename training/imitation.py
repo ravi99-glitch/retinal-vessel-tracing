@@ -346,8 +346,8 @@ class ImitationSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         seq = self.sequences[idx]
-        obs = np.stack(seq["observations"], axis=0)       # (T, C, H, W)
-        actions = np.array(seq["actions"], dtype=np.int64) # (T,)
+        obs = np.stack(seq["observations"], axis=0)  # (T, C, H, W)
+        actions = np.array(seq["actions"], dtype=np.int64)  # (T,)
         return {
             "observations": torch.from_numpy(obs).float(),
             "actions": torch.from_numpy(actions).long(),
@@ -620,9 +620,7 @@ class ImitationTrainer:
 
         print(f"\nDone. Best val_loss={best_val_loss:.4f}  →  {save_path}")
 
-    def _run_epoch_lstm(
-        self, loader: DataLoader, train: bool
-    ) -> Tuple[float, float]:
+    def _run_epoch_lstm(self, loader: DataLoader, train: bool) -> Tuple[float, float]:
         """Run one LSTM epoch over padded sequence batches.
 
         Each batch from the loader (via sequence_collate_fn) contains:
@@ -641,21 +639,17 @@ class ImitationTrainer:
         with ctx:
             for batch in loader:
                 obs_seq = batch["observations"].to(self.device)  # (T, B, C, H, W)
-                actions = batch["actions"].to(self.device)       # (T, B)
-                mask = batch["mask"].to(self.device)             # (T, B)
-                dones = batch["dones"].to(self.device)           # (T, B)
+                actions = batch["actions"].to(self.device)  # (T, B)
+                mask = batch["mask"].to(self.device)  # (T, B)
+                dones = batch["dones"].to(self.device)  # (T, B)
 
                 T, B = obs_seq.shape[:2]
 
                 # Fresh hidden state for each batch
-                init_state = self.model.init_hidden(
-                    batch_size=B, device=self.device
-                )
+                init_state = self.model.init_hidden(batch_size=B, device=self.device)
 
                 # Sequential forward through the whole padded sequence
-                logits_seq, _ = self.model.forward_sequence(
-                    obs_seq, init_state, dones
-                )
+                logits_seq, _ = self.model.forward_sequence(obs_seq, init_state, dones)
                 # logits_seq: (T, B, N_ACTIONS)
 
                 # Masked cross-entropy
