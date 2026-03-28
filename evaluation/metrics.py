@@ -20,8 +20,23 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import ndimage
+from scipy.ndimage import label as ndimage_label
 from skimage import measure
 from skimage.morphology import skeletonize
+
+
+def compute_betti0(binary_mask: np.ndarray, connectivity: int = 2) -> int:
+    """Count connected components (Betti-0) of a binary mask.
+
+    Cheap enough for periodic use during training.
+    connectivity=2 → 8-connected (matches your existing betti_0_error).
+    """
+    if binary_mask.sum() == 0:
+        return 0
+    _, n_components = measure.label(
+        binary_mask > 0, return_num=True, connectivity=connectivity
+    )
+    return int(n_components)
 
 
 class CenterlineMetrics:
@@ -248,18 +263,23 @@ class CenterlineMetrics:
     # BETTI-0 ERROR
     # ============================================================
 
-    def betti_0_error(
-        self,
-        pred: np.ndarray,
-        gt: np.ndarray,
-    ) -> float:
-        """Absolute difference in number of connected components (8-connectivity).
-        Lower is better; 0 means topology matches GT exactly.
-        """
-        _, pred_b0 = measure.label(pred > 0, return_num=True, connectivity=2)
-        _, gt_b0 = measure.label(gt > 0, return_num=True, connectivity=2)
+    def betti_0_error(self, pred: np.ndarray, gt: np.ndarray) -> float:
+        pred_b0 = compute_betti0(pred)
+        gt_b0 = compute_betti0(gt)
+        return float(abs(pred_b0 - gt_b0))
 
-        return float(abs(int(pred_b0) - int(gt_b0)))
+    # def betti_0_error(
+    #     self,
+    #     pred: np.ndarray,
+    #     gt: np.ndarray,
+    # ) -> float:
+    #     """Absolute difference in number of connected components (8-connectivity).
+    #     Lower is better; 0 means topology matches GT exactly.
+    #     """
+    #     _, pred_b0 = measure.label(pred > 0, return_num=True, connectivity=2)
+    #     _, gt_b0 = measure.label(gt > 0, return_num=True, connectivity=2)
+
+    #     return float(abs(int(pred_b0) - int(gt_b0)))
 
     # ============================================================
     # HD95 (Symmetric)

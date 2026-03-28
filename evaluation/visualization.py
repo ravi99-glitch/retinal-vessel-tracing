@@ -1,6 +1,5 @@
 # evaluation/visualization.py
-"""Visualization utilities for vessel tracing.
-"""
+"""Visualization utilities for vessel tracing."""
 
 from typing import Dict, List, Optional, Tuple
 
