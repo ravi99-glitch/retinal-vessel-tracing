@@ -1,6 +1,5 @@
 # observation.py
-"""Observation construction for vessel tracing environment.
-"""
+"""Observation construction for vessel tracing environment."""
 
 from typing import Any, Dict, Optional
 
@@ -11,22 +10,21 @@ class ObservationBuilder:
     """Builds observation tensors for the RL agent.
 
     Channels (use_vesselness=False):
-      0-2 : RGB crop
-      3   : visited mask crop
-      4   : distance transform crop, normalised to [0, 1]
-      5   : vessel gradient dy (from DT), normalised to [-1, 1]
-      6   : vessel gradient dx (from DT), normalised to [-1, 1]
+    0-2 : RGB crop
+    3   : visited mask crop
+    4   : distance transform crop, normalised to [0, 1]
+    5   : vessel gradient dy (from DT), normalised to [-1, 1]
+    6   : vessel gradient dx (from DT), normalised to [-1, 1]
+    7   : centerline binary mask                                  # NEW
+    8   : vessel tangent dy (along-vessel direction)               # NEW
+    9   : vessel tangent dx (along-vessel direction)               # NEW
 
-    Total: 7 channels
+    Total: 10 channels (11 with vesselness)
 
-    The vessel gradient channels encode the local vessel direction from the
-    image itself (via the distance transform), not from the agent's own history.
-    This directly fixes the directional lock-in problem where the agent committed
-    to one direction (East) regardless of vessel geometry.
-
-    The prev_direction scalar channel is removed — it was the primary cause of
-    directional collapse since PPO reinforced whatever direction happened to be
-    profitable early in training.
+    Channels 5-6 point TOWARD the centerline (perpendicular to vessel).
+    Channels 8-9 point ALONG the vessel (tangent direction from structure tensor).
+    Together they give the agent full local geometry: where the centerline is,
+    which way to approach it, and which way the vessel runs.
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -44,6 +42,8 @@ class ObservationBuilder:
         position: np.ndarray,
         prev_direction: Optional[int],  # kept for API compat, unused
         distance_transform: Optional[np.ndarray] = None,
+        centerline: Optional[np.ndarray] = None,
+        vessel_orientation: Optional[np.ndarray] = None,  # (H,W,2)
     ) -> np.ndarray:
         """Build observation tensor.
 
@@ -103,6 +103,34 @@ class ObservationBuilder:
             zeros = np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
             channels += [zeros, zeros, zeros]
 
+        # Centerline binary mask (1 channel)
+        if centerline is not None:
+            cl_crop = self._crop(
+                centerline[:, :, np.newaxis], y_start, y_end, x_start, x_end
+            )[:, :, 0]
+            cl_ch = (cl_crop > 0).astype(np.float32)
+            channels.append(cl_ch[np.newaxis])  # (1,H,W)
+        else:
+            channels.append(
+                np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
+            )
+
+        # Vessel tangent direction (2 channels)
+        if vessel_orientation is not None:
+            orient_crop = self._crop(
+                vessel_orientation, y_start, y_end, x_start, x_end
+            )  # (obs_size, obs_size, 2)
+            channels.append(
+                orient_crop[:, :, 0][np.newaxis].astype(np.float32)
+            )  # tangent_y
+            channels.append(
+                orient_crop[:, :, 1][np.newaxis].astype(np.float32)
+            )  # tangent_x
+        else:
+            zeros = np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
+            channels.append(zeros)
+            channels.append(zeros)
+
         # --- Vesselness (1 channel, optional) ---
         if self.use_vesselness and vesselness is not None:
             v_crop = self._crop(
@@ -137,3 +165,43 @@ class ObservationBuilder:
             crop = np.pad(crop, pw, mode="constant", constant_values=0)
 
         return crop
+
+    def compute_vessel_orientation(self, image: np.ndarray) -> np.ndarray:
+        """Precompute vessel tangent direction from the image structure tensor.
+
+        Uses the green channel (best vessel contrast in fundus images).
+        Returns (H, W, 2) array of [tangent_y, tangent_x], normalised.
+
+        Should be called once per image (in env.set_data), not per step.
+        """
+        # Use green channel for best vessel contrast
+        if image.ndim == 3:
+            gray = image[:, :, 1].astype(np.float64)
+        else:
+            gray = image.astype(np.float64)
+
+        # Image gradients
+        iy = np.gradient(gray, axis=0)
+        ix = np.gradient(gray, axis=1)
+
+        # Structure tensor components (Gaussian-weighted local averages)
+        from scipy.ndimage import gaussian_filter
+
+        sigma = 3.0  # integration scale — ~vessel width
+        j_xx = gaussian_filter(ix * ix, sigma)
+        j_xy = gaussian_filter(ix * iy, sigma)
+        j_yy = gaussian_filter(iy * iy, sigma)
+
+        # Eigendecomposition: smallest eigenvector = vessel tangent
+        # For 2x2 symmetric matrix, analytic solution:
+        # θ = 0.5 * atan2(2*Jxy, Jxx - Jyy)  gives the dominant orientation
+        # The perpendicular direction (vessel tangent) is θ + π/2
+        theta = 0.5 * np.arctan2(2.0 * j_xy, j_xx - j_yy + 1e-10)
+
+        # Dominant eigenvector direction (perpendicular to vessel)
+        # Rotate 90° to get vessel tangent
+        tangent_y = -np.sin(theta).astype(np.float32)  # rotated by 90°
+        tangent_x = np.cos(theta).astype(np.float32)
+
+        orientation = np.stack([tangent_y, tangent_x], axis=-1)  # (H, W, 2)
+        return orientation

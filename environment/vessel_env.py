@@ -1,7 +1,6 @@
-# vessel_env.py
-"""RL Environment for vessel tracing.
-"""
+"""RL Environment for vessel tracing."""
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -9,14 +8,14 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from evaluation.metrics import compute_betti0
+
 from .observation import ObservationBuilder
 from .reward import RewardCalculator
 
 
 @dataclass
 class EnvConfig:
-    """Environment configuration."""
-
     observation_size: int = 65
     step_size: int = 1
     tolerance: float = 2.0
@@ -26,34 +25,19 @@ class EnvConfig:
 
 
 class VesselTracingEnv(gym.Env):
-    """RL Environment for tracing vessel centerlines.
 
-    The agent navigates through the image making 8-directional moves
-    to trace vessel centerlines while avoiding off-centerline regions.
-    """
-
-    # 8-directional moves: N, NE, E, SE, S, SW, W, NW
     DIRECTIONS = np.array(
-        [
-            [-1, 0],  # 0 N
-            [-1, 1],  # 1 NE
-            [0, 1],  # 2 E
-            [1, 1],  # 3 SE
-            [1, 0],  # 4 S
-            [1, -1],  # 5 SW
-            [0, -1],  # 6 W
-            [-1, -1],  # 7 NW
-        ]
+        [[-1, 0], [-1, 1], [0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1]]
     )
 
     def __init__(
         self,
-        config: Dict[str, Any],
-        image: Optional[np.ndarray] = None,
-        centerline: Optional[np.ndarray] = None,
-        distance_transform: Optional[np.ndarray] = None,
-        vesselness: Optional[np.ndarray] = None,
-        fov_mask: Optional[np.ndarray] = None,
+        config,
+        image=None,
+        centerline=None,
+        distance_transform=None,
+        vesselness=None,
+        fov_mask=None,
     ):
         super().__init__()
 
@@ -66,11 +50,17 @@ class VesselTracingEnv(gym.Env):
         self.max_off_track = env_config.get("max_off_track_streak", 3)
         self.max_steps = env_config.get("max_steps_per_episode", 2000)
 
+        # Momentum blending
+        self.momentum = env_config.get("momentum", 0.0)
+        # 0.0 = no momentum (pure discrete), 0.3 = mild smoothing
+
         self.image = image
         self.centerline = centerline
         self.distance_transform = distance_transform
         self.vesselness = vesselness
         self.fov_mask = fov_mask
+
+        self.vessel_orientation = None  # precomputed (H,W,2), set in set_data()
 
         if image is not None:
             self.height, self.width = image.shape[:2]
@@ -92,28 +82,31 @@ class VesselTracingEnv(gym.Env):
         self.prev_direction = None
         self.covered_centerline = None
 
-    def _setup_observation_space(self):
-        # Channels: RGB(3) + visited(1) + dt(1) + grad_y(1) + grad_x(1)
-        use_vesselness = self.config.get("environment", {}).get("use_vesselness", False)
+        # Action history for oscillation detection
+        hist_len = config.get("reward", {}).get("oscillation_window", 6) + 2
+        self.action_history: deque = deque(maxlen=hist_len)
+        self._momentum_vec: Optional[np.ndarray] = None  # running direction
 
-        n_channels = 7
+        # Betti-0 tracking
+        self._prev_betti0: int = 0
+        self._betti0_check_interval: int = config.get("reward", {}).get(
+            "betti0_check_interval", 50
+        )
+
+    def _setup_observation_space(self):
+        use_vesselness = self.config.get("environment", {}).get("use_vesselness", False)
+        n_channels = 10  # was 7
         if use_vesselness:
             n_channels += 1
-
         self.observation_space = spaces.Box(
             low=-1.0,
-            high=1.0,  # Note: Grad_X and Grad_Y can be negative!
+            high=1.0,
             shape=(n_channels, self.obs_size, self.obs_size),
             dtype=np.float32,
         )
 
     def set_data(
-        self,
-        image: np.ndarray,
-        centerline: np.ndarray,
-        distance_transform: np.ndarray,
-        vesselness: Optional[np.ndarray] = None,
-        fov_mask: Optional[np.ndarray] = None,
+        self, image, centerline, distance_transform, vesselness=None, fov_mask=None
     ):
         self.image = image
         self.centerline = centerline
@@ -121,13 +114,11 @@ class VesselTracingEnv(gym.Env):
         self.vesselness = vesselness
         self.fov_mask = fov_mask if fov_mask is not None else np.ones_like(centerline)
         self.height, self.width = image.shape[:2]
+        self.vessel_orientation = self.observation_builder.compute_vessel_orientation(
+            image
+        )  # precompute vessel orientation (once per image)
 
-    def reset(
-        self,
-        seed: Optional[int] = None,
-        start_position: Optional[Tuple[int, int]] = None,
-        **kwargs
-    ) -> Tuple[np.ndarray, Dict]:
+    def reset(self, seed=None, start_position=None, **kwargs):
         super().reset(seed=seed)
 
         if self.image is None:
@@ -139,6 +130,11 @@ class VesselTracingEnv(gym.Env):
         self.off_track_streak = 0
         self.prev_direction = None
         self.covered_centerline = np.zeros_like(self.centerline, dtype=np.float32)
+
+        # Reset history
+        self.action_history.clear()
+        self._momentum_vec = None
+        self._prev_betti0 = 0
 
         if start_position is not None:
             self.position = np.array(start_position, dtype=np.int32)
@@ -153,40 +149,50 @@ class VesselTracingEnv(gym.Env):
 
     def _sample_start_position(self) -> np.ndarray:
         centerline_points = np.argwhere(self.centerline > 0)
-
         if len(centerline_points) == 0:
             fov_points = np.argwhere(self.fov_mask > 0)
             if len(fov_points) == 0:
                 return np.array([self.height // 2, self.width // 2])
             idx = self.np_random.integers(len(fov_points))
             return fov_points[idx]
-
-        # Prefer endpoints
         from data.centerline_extraction import CenterlineExtractor
 
         extractor = CenterlineExtractor()
         endpoints = extractor._find_endpoints(self.centerline)
-
         if endpoints:
             idx = self.np_random.integers(len(endpoints))
             return np.array(endpoints[idx])
-
         idx = self.np_random.integers(len(centerline_points))
         return centerline_points[idx]
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+    def step(self, action: int):
         self.step_count += 1
 
         # STOP action
         if action == 8:
+            self.action_history.append(action)
             reward = self.reward_calculator.compute_terminal_reward(
                 self.covered_centerline, self.centerline
             )
             return self._get_observation(), reward, True, False, self._get_info()
 
-        # Compute new position
-        direction = self.DIRECTIONS[action] * self.step_size
-        new_position = self.position + direction
+        # Compute new position (with optional momentum)
+        raw_direction = self.DIRECTIONS[action].astype(np.float64) * self.step_size
+
+        if self.momentum > 0 and self._momentum_vec is not None:
+            blended = (
+                1.0 - self.momentum
+            ) * raw_direction + self.momentum * self._momentum_vec
+            # snap back to grid
+            new_position = self.position + np.round(blended).astype(np.int32)
+            # Ensure we actually moved (avoid rounding to zero displacement)
+            if np.array_equal(new_position, self.position):
+                new_position = self.position + raw_direction.astype(np.int32)
+            self._momentum_vec = blended / (np.linalg.norm(blended) + 1e-8)
+        else:
+            new_position = self.position + raw_direction.astype(np.int32)
+            norm = np.linalg.norm(raw_direction)
+            self._momentum_vec = raw_direction / (norm + 1e-8) if norm > 0 else None
 
         # Out of bounds
         if not self._is_valid_position(new_position):
@@ -203,6 +209,9 @@ class VesselTracingEnv(gym.Env):
         distance = self.distance_transform[self.position[0], self.position[1]]
         is_on_track = distance <= self.tolerance
 
+        # Capture streak before reset for bridge detection
+        pre_step_off_track_streak = self.off_track_streak
+
         if is_on_track:
             self.off_track_streak = 0
         else:
@@ -212,6 +221,8 @@ class VesselTracingEnv(gym.Env):
         self._update_coverage()
         new_coverage = self.covered_centerline.sum() - prev_coverage
 
+        self.action_history.append(action)
+
         reward = self.reward_calculator.compute_step_reward(
             distance=distance,
             is_revisit=is_revisit,
@@ -220,7 +231,22 @@ class VesselTracingEnv(gym.Env):
             prev_distance=self.distance_transform[old_position[0], old_position[1]],
             action=action,
             prev_action=self.prev_direction,
+            action_history=list(self.action_history),
+            off_track_streak=pre_step_off_track_streak,
         )
+
+        # local merge reward (every step, cheap)
+        reward += self.reward_calculator.compute_local_merge_reward(
+            self.position, self.visited_mask
+        )
+
+        # periodic Betti-0 delta reward (every N steps)
+        if self.step_count % self._betti0_check_interval == 0 and self.step_count > 0:
+            current_b0 = compute_betti0(self.visited_mask)
+            reward += self.reward_calculator.compute_betti0_delta_reward(
+                self._prev_betti0, current_b0
+            )
+            self._prev_betti0 = current_b0
 
         self.prev_direction = action
 
@@ -230,9 +256,17 @@ class VesselTracingEnv(gym.Env):
         if terminated:
             reward += self.reward_calculator.compute_off_track_termination_penalty()
 
+        if terminated or truncated:
+            reward += self.reward_calculator.compute_betti0_episode_reward(
+                self.visited_mask, self.centerline
+            )
+
+        # if terminated:
+        #     reward += self.reward_calculator.compute_off_track_termination_penalty()
+
         return self._get_observation(), reward, terminated, truncated, self._get_info()
 
-    def _is_valid_position(self, position: np.ndarray) -> bool:
+    def _is_valid_position(self, position):
         y, x = position
         half = self.obs_size // 2
         if y < half or y >= self.height - half:
@@ -246,12 +280,10 @@ class VesselTracingEnv(gym.Env):
     def _update_coverage(self):
         y, x = self.position
         tol_i = int(self.tolerance)
-
         y_min = max(0, y - tol_i - 1)
         y_max = min(self.height, y + tol_i + 2)
         x_min = max(0, x - tol_i - 1)
         x_max = min(self.width, x + tol_i + 2)
-
         for py in range(y_min, y_max):
             for px in range(x_min, x_max):
                 if self.centerline[py, px] > 0:
@@ -259,17 +291,19 @@ class VesselTracingEnv(gym.Env):
                     if dist <= self.tolerance:
                         self.covered_centerline[py, px] = 1.0
 
-    def _get_observation(self) -> np.ndarray:
+    def _get_observation(self):
         return self.observation_builder.build(
             image=self.image,
             visited_mask=self.visited_mask,
             vesselness=self.vesselness,
             position=self.position,
             prev_direction=self.prev_direction,
-            distance_transform=self.distance_transform,  # new arg
+            distance_transform=self.distance_transform,
+            centerline=self.centerline,
+            vessel_orientation=self.vessel_orientation,
         )
 
-    def _get_info(self) -> Dict[str, Any]:
+    def _get_info(self):
         total = self.centerline.sum()
         covered = self.covered_centerline.sum()
         return {
@@ -282,7 +316,7 @@ class VesselTracingEnv(gym.Env):
             "total_centerline_pixels": int(total),
         }
 
-    def render(self) -> np.ndarray:
+    def render(self):
         vis = (self.image.copy() * 255).astype(np.uint8)
         vis[self.centerline > 0] = [0, 0, 255]
         vis[self.covered_centerline > 0] = [0, 255, 0]

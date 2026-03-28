@@ -13,8 +13,7 @@ from tqdm import tqdm
 
 
 class FrontierTracer:
-    """Single source of truth for Frontier-Based Coverage (Algorithm 2).
-    """
+    """Single source of truth for Frontier-Based Coverage (Algorithm 2)."""
 
     def __init__(self, env, policy_model, device, obs_size: int = 65):
         self.env = env
@@ -26,8 +25,7 @@ class FrontierTracer:
     def _execute_single_trace(
         self, start_pos: Tuple[int, int], combined_mask: np.ndarray
     ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-        """Executes a single continuous trace until the agent stops or terminates.
-        """
+        """Executes a single continuous trace until the agent stops or terminates."""
         obs, _ = self.env.reset(start_position=start_pos)
         path = [start_pos]
         done = False
@@ -54,8 +52,7 @@ class FrontierTracer:
     def trace_from_seeds(
         self, sample: Dict[str, Any], initial_seeds: List[Tuple[int, int]]
     ) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
-        """True End-to-End Inference: Algorithm 2 using a stack-based frontier.
-        """
+        """True End-to-End Inference: Algorithm 2 using a stack-based frontier."""
         self._setup_env(sample)
         h, w = sample["image"].shape[:2]
         combined_mask = np.zeros((h, w), dtype=np.float32)
@@ -76,7 +73,24 @@ class FrontierTracer:
             path, alternate_branches = self._execute_single_trace(
                 start_pos, combined_mask
             )
-            all_paths.append(path)
+
+            # Split trace at off-vessel bridges
+            dt = self.env.distance_transform
+            tol = self.env.tolerance
+            sub_paths = self._split_trace_at_bridges(path, dt, tol)
+
+            # Re-stamp combined_mask with only on-vessel segments
+            for sp in sub_paths:
+                all_paths.append(sp)
+                for y, x in sp:
+                    combined_mask[y, x] = 1.0
+
+            # Clear off-vessel bridge pixels from combined_mask
+            for y, x in path:
+                if dt[y, x] > tol:
+                    combined_mask[y, x] = 0.0
+
+            # all_paths.append(path)
 
             for branch_pos in alternate_branches:
                 if combined_mask[branch_pos[0], branch_pos[1]] == 0:
@@ -92,8 +106,7 @@ class FrontierTracer:
         max_traces: int = 50,
         min_coverage_gain: float = 0.005,
     ) -> Tuple[np.ndarray, List[List[Tuple[int, int]]]]:
-        """Evaluation method: Iteratively forces the agent into ground-truth gaps.
-        """
+        """Evaluation method: Iteratively forces the agent into ground-truth gaps."""
         self._setup_env(sample)
         h, w = sample["image"].shape[:2]
         combined_mask = np.zeros((h, w), dtype=np.float32)
@@ -112,7 +125,24 @@ class FrontierTracer:
 
             covered_before = combined_mask.sum()
             path, _ = self._execute_single_trace(start_pos, combined_mask)
-            all_paths.append(path)
+
+            # Split trace at off-vessel bridges
+            dt = self.env.distance_transform
+            tol = self.env.tolerance
+            sub_paths = self._split_trace_at_bridges(path, dt, tol)
+
+            # Re-stamp combined_mask with only on-vessel segments
+            for sp in sub_paths:
+                all_paths.append(sp)
+                for y, x in sp:
+                    combined_mask[y, x] = 1.0
+
+            # Clear off-vessel bridge pixels from combined_mask
+            for y, x in path:
+                if dt[y, x] > tol:
+                    combined_mask[y, x] = 0.0
+
+            # all_paths.append(path)
 
             gain = (combined_mask.sum() - covered_before) / gt_total
             coverage_pct = combined_mask.sum() / gt_total
@@ -160,3 +190,32 @@ class FrontierTracer:
         y = int(np.clip(best[0], self.half, h - self.half - 1))
         x = int(np.clip(best[1], self.half, w - self.half - 1))
         return (y, x)
+
+    def _split_trace_at_bridges(
+        self,
+        path: List[Tuple[int, int]],
+        distance_transform: np.ndarray,
+        tolerance: float,
+    ) -> List[List[Tuple[int, int]]]:
+        """Split a single trace into sub-traces wherever it went off-vessel.
+
+        Removes bridge segments that cross non-vessel regions.
+        Only keeps sub-traces with >= 3 on-vessel points.
+        """
+        segments = []
+        current_segment = []
+
+        for y, x in path:
+            if distance_transform[y, x] <= tolerance:
+                current_segment.append((y, x))
+            else:
+                # Off-vessel point — close current segment
+                if len(current_segment) >= 3:
+                    segments.append(current_segment)
+                current_segment = []
+
+        # Don't forget the last segment
+        if len(current_segment) >= 3:
+            segments.append(current_segment)
+
+        return segments if segments else [path]  # fallback: keep original
