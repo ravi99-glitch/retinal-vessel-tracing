@@ -19,10 +19,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.frangi import FrangiBaseline
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, get_test_data
 from evaluation.metrics import CenterlineMetrics
+from models.frangi import FrangiBaseline
 
 # ==========================================
 # METRIC SETTINGS
@@ -55,14 +55,13 @@ FRANGI_PARAMS = {
         gauss_sigma=1.2,
         min_size=75,
     ),
-    
     "DRHAGIS": dict(
-        sigma_min=0.5,     
-        sigma_max=4.0,     
-        num_scales=10,     
-        threshold=0.004,   
-        gauss_sigma=1.0,   
-        min_size=100,       
+        sigma_min=0.5,
+        sigma_max=4.0,
+        num_scales=10,
+        threshold=0.004,
+        gauss_sigma=1.0,
+        min_size=100,
     ),
 }
 
@@ -74,6 +73,7 @@ DEFAULT_FRANGI_PARAMS = dict(
     gauss_sigma=1.0,
     min_size=50,
 )
+
 
 # ==========================================
 # MAIN

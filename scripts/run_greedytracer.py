@@ -18,10 +18,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.greedy_tracer import GreedyTracerBaseline
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, get_test_data
 from evaluation.metrics import CenterlineMetrics
+from models.greedy_tracer import GreedyTracerBaseline
 
 # ==========================================
 # METRIC SETTINGS
@@ -48,26 +48,25 @@ METRIC_COLS = [
 GREEDY_PARAMS = {
     "DRIVE": dict(
         sigma_min=0.5,
-        sigma_max=2.5,          
-        num_scales=5,           
-        gauss_sigma=1.0,        
-        seed_thresh=0.1727,     
-        step_thresh=0.0909,     
-        min_length=10.0,        
+        sigma_max=2.5,
+        num_scales=5,
+        gauss_sigma=1.0,
+        seed_thresh=0.1727,
+        step_thresh=0.0909,
+        min_length=10.0,
         thin_output=True,
         min_obj_size=0,
     ),
-    
     "DRHAGIS": dict(
         sigma_min=0.5,
-        sigma_max=2.5,          
-        num_scales=5,           
-        gauss_sigma=0.8,        
-        seed_thresh=0.4,        
-        step_thresh=0.1891,     
-        min_length=10.0,        
+        sigma_max=2.5,
+        num_scales=5,
+        gauss_sigma=0.8,
+        seed_thresh=0.4,
+        step_thresh=0.1891,
+        min_length=10.0,
         thin_output=True,
-        min_obj_size=50,        
+        min_obj_size=50,
     ),
 }
 
@@ -92,6 +91,7 @@ FONT_SIZE_LEGEND = 10
 TOP_N_ORDER = 50
 DPI = 200
 
+
 # ==========================================
 # HELPERS
 # ==========================================
@@ -104,14 +104,20 @@ def save_standard_panel(
     fig, axes = plt.subplots(1, 4, figsize=(24, 7), facecolor="white")
 
     axes[0].imshow(img_rgb)
-    axes[0].set_title(f"Original Image (ID: {image_id})", fontweight="bold", fontsize=FONT_SIZE_TITLE)
+    axes[0].set_title(
+        f"Original Image (ID: {image_id})", fontweight="bold", fontsize=FONT_SIZE_TITLE
+    )
 
     axes[1].imshow(vessel_vis, cmap="gray")
     axes[1].set_title("Vesselness Map", fontweight="bold", fontsize=FONT_SIZE_TITLE)
 
     side_by_side = np.concatenate([gt_skel_vis, pred_skel_vis], axis=1)
     axes[2].imshow(side_by_side, cmap="gray")
-    axes[2].set_title("1px Skeletons\n(Left: GT | Right: Pred)", fontweight="bold", fontsize=FONT_SIZE_TITLE)
+    axes[2].set_title(
+        "1px Skeletons\n(Left: GT | Right: Pred)",
+        fontweight="bold",
+        fontsize=FONT_SIZE_TITLE,
+    )
 
     overlay = np.zeros((*img_rgb.shape[:2], 3), dtype=np.uint8)
     overlay[..., 1] = gt_skel_vis
@@ -122,7 +128,9 @@ def save_standard_panel(
         f"F1@2px: {res.get('f1@2px', 0):.3f} | "
         f"clDice: {res.get('clDice', 0):.3f} | "
         f"IoU: {res.get('iou', 0):.3f}",
-        fontweight="bold", color="darkblue", fontsize=FONT_SIZE_TITLE,
+        fontweight="bold",
+        color="darkblue",
+        fontsize=FONT_SIZE_TITLE,
     )
 
     legend_elements = [
@@ -130,17 +138,31 @@ def save_standard_panel(
         Patch(facecolor="red", edgecolor="black", label="Pred"),
         Patch(facecolor="yellow", edgecolor="black", label="Match"),
     ]
-    axes[3].legend(handles=legend_elements, loc="lower center", bbox_to_anchor=(0.5, -0.15), ncol=3, frameon=False, fontsize=FONT_SIZE_LEGEND)
+    axes[3].legend(
+        handles=legend_elements,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=3,
+        frameon=False,
+        fontsize=FONT_SIZE_LEGEND,
+    )
 
     for ax in axes:
         ax.axis("off")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(panels_dir, f"{image_id}_greedy_panel.png"), bbox_inches="tight", dpi=DPI)
+    plt.savefig(
+        os.path.join(panels_dir, f"{image_id}_greedy_panel.png"),
+        bbox_inches="tight",
+        dpi=DPI,
+    )
     plt.close()
 
-def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir, dataset_name=""):
-    if len(traces) == 0: 
+
+def save_trajectory_panel(
+    vesselness, mask, traces, image_id, traj_dir, dataset_name=""
+):
+    if len(traces) == 0:
         return
 
     fov_bin = (mask > 0).astype(np.float32)
@@ -156,7 +178,9 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir, dataset_
 
     axes[0].imshow(vessel_bg, cmap="gray", vmin=0, vmax=1)
     axes[0].scatter(seeds[:, 1], seeds[:, 0], c="cyan", s=12, alpha=0.8)
-    axes[0].set_title(f"Vesselness + {len(traces)} Seeds", color="white", fontsize=FONT_SIZE_TITLE)
+    axes[0].set_title(
+        f"Vesselness + {len(traces)} Seeds", color="white", fontsize=FONT_SIZE_TITLE
+    )
 
     n_show = min(TOP_N_ORDER, len(traces))
     cmap_order = plt.cm.plasma
@@ -164,8 +188,12 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir, dataset_
     axes[1].imshow(vessel_bg, cmap="gray", alpha=0.2)
     for idx in range(n_show):
         coords = np.array(traces[idx])
-        axes[1].plot(coords[:, 1], coords[:, 0], color=cmap_order(order_norm(idx)), linewidth=1.2)
-    axes[1].set_title(f"Top-{n_show} Visit Order", color="white", fontsize=FONT_SIZE_TITLE)
+        axes[1].plot(
+            coords[:, 1], coords[:, 0], color=cmap_order(order_norm(idx)), linewidth=1.2
+        )
+    axes[1].set_title(
+        f"Top-{n_show} Visit Order", color="white", fontsize=FONT_SIZE_TITLE
+    )
 
     sm = plt.cm.ScalarMappable(cmap=cmap_order, norm=order_norm)
     cbar = plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
@@ -174,18 +202,34 @@ def save_trajectory_panel(vesselness, mask, traces, image_id, traj_dir, dataset_
 
     axes[2].axis("on")
     axes[2].set_facecolor("#1a1a1a")
-    log_bins = np.logspace(np.log10(max(trace_lengths.min(), 1)), np.log10(trace_lengths.max()), 40)
+    log_bins = np.logspace(
+        np.log10(max(trace_lengths.min(), 1)), np.log10(trace_lengths.max()), 40
+    )
     axes[2].hist(trace_lengths, bins=log_bins, color="#f07f2a", alpha=0.85)
     axes[2].set_xscale("log")
-    axes[2].set_title("Length Distribution (log x)", color="white", fontsize=FONT_SIZE_TITLE)
+    axes[2].set_title(
+        "Length Distribution (log x)", color="white", fontsize=FONT_SIZE_TITLE
+    )
     axes[2].tick_params(colors="white")
     axes[2].set_xlabel("Trace Length (pixels)", color="white", fontsize=FONT_SIZE_LABEL)
     axes[2].set_ylabel("Count", color="white", fontsize=FONT_SIZE_LABEL)
 
-    plt.suptitle(f"Greedy Tracer Trajectory Analysis — {dataset_name} — {image_id}", color="white", fontsize=FONT_SIZE_TITLE + 4, fontweight="bold", y=1.02)
+    plt.suptitle(
+        f"Greedy Tracer Trajectory Analysis — {dataset_name} — {image_id}",
+        color="white",
+        fontsize=FONT_SIZE_TITLE + 4,
+        fontweight="bold",
+        y=1.02,
+    )
     plt.tight_layout()
-    plt.savefig(os.path.join(traj_dir, f"{image_id}_trajectory.png"), facecolor=BG, dpi=DPI, bbox_inches="tight")
+    plt.savefig(
+        os.path.join(traj_dir, f"{image_id}_trajectory.png"),
+        facecolor=BG,
+        dpi=DPI,
+        bbox_inches="tight",
+    )
     plt.close()
+
 
 # ==========================================
 # EVALUATE
@@ -198,7 +242,7 @@ def evaluate(dataset_name):
     os.makedirs(traj_dir, exist_ok=True)
 
     dataset, _ = get_test_data(dataset_name, "greedy_tracer", batch_size=1, resize=None)
-    
+
     # FETCH DATASET SPECIFIC PARAMS
     params = GREEDY_PARAMS.get(dataset_name, DEFAULT_GREEDY_PARAMS)
     model = GreedyTracerBaseline(**params)
@@ -209,43 +253,77 @@ def evaluate(dataset_name):
 
     for i in tqdm(range(len(dataset)), desc=f"Greedy Tracer — {dataset_name}"):
         sample = dataset[i]
-        image_id, img_rgb, fov_mask, vessel_mask = sample["id"], sample["image"], sample["fov_mask"], sample["vessel_mask"]
+        image_id, img_rgb, fov_mask, vessel_mask = (
+            sample["id"],
+            sample["image"],
+            sample["fov_mask"],
+            sample["vessel_mask"],
+        )
 
         gt_skel = (skeletonize(vessel_mask > 128) * 255).astype(np.uint8)
 
         pred_skel, vesselness, traces = model.extract_centerline(
-            sample["preprocessed"], fov_mask=fov_mask, return_vesselness=True,
+            sample["preprocessed"],
+            fov_mask=fov_mask,
+            return_vesselness=True,
         )
 
         res = metrics_fn.compute_all_metrics(
-            pred_skeleton=pred_skel, gt_skeleton=gt_skel,
+            pred_skeleton=pred_skel,
+            gt_skeleton=gt_skel,
             pred_vessel_mask=(vesselness >= 0.5).astype(np.uint8) * 255,
-            gt_vessel_mask=vessel_mask, fov_mask=fov_mask,
+            gt_vessel_mask=vessel_mask,
+            fov_mask=fov_mask,
         )
-        
-        res.update({
-            "image_id": image_id,
-            "num_traces": len(traces),
-            "median_len": float(np.median([len(t) for t in traces])) if traces else 0.0,
-        })
+
+        res.update(
+            {
+                "image_id": image_id,
+                "num_traces": len(traces),
+                "median_len": (
+                    float(np.median([len(t) for t in traces])) if traces else 0.0
+                ),
+            }
+        )
         all_metrics.append(res)
 
         # Visuals
-        save_standard_panel(img_rgb, vesselness, (gt_skel > 0) * 255, (pred_skel > 0) * 255, fov_mask, res, image_id, panels_dir)
-        save_trajectory_panel(vesselness, fov_mask, traces, image_id, traj_dir, dataset_name=dataset_name)
+        save_standard_panel(
+            img_rgb,
+            vesselness,
+            (gt_skel > 0) * 255,
+            (pred_skel > 0) * 255,
+            fov_mask,
+            res,
+            image_id,
+            panels_dir,
+        )
+        save_trajectory_panel(
+            vesselness, fov_mask, traces, image_id, traj_dir, dataset_name=dataset_name
+        )
 
     # Summary and CSVs
     df = pd.DataFrame(all_metrics)
-    summary_rows = [{"Metric": c, "Mean +/- Std": f"{df[c].mean():.4f} +/- {df[c].std():.4f}"} for c in METRIC_COLS if c in df.columns]
+    summary_rows = [
+        {"Metric": c, "Mean +/- Std": f"{df[c].mean():.4f} +/- {df[c].std():.4f}"}
+        for c in METRIC_COLS
+        if c in df.columns
+    ]
     summary_df = pd.DataFrame(summary_rows)
 
-    print("\n" + "=" * 55 + f"\n   GREEDY TRACER — {dataset_name} (N={len(dataset)})\n" + "=" * 55)
+    print(
+        "\n"
+        + "=" * 55
+        + f"\n   GREEDY TRACER — {dataset_name} (N={len(dataset)})\n"
+        + "=" * 55
+    )
     print(summary_df.to_string(index=False))
     print("=" * 55)
 
     summary_df.to_csv(os.path.join(output_dir, "metrics_summary.csv"), index=False)
     df.to_csv(os.path.join(output_dir, "metrics_per_image.csv"), index=False)
     return df
+
 
 if __name__ == "__main__":
     for name in TEST_DATASETS:

@@ -14,53 +14,66 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.dataloader import WEIGHTS_DIR, get_data
+from config import DEVICE
+from config import IMITATION_WEIGHTS_PATH as IMITATION_WEIGHTS
+from config import LSTM_CHUNK_LENGTH, MAX_STEPS
+from config import MODEL_CONFIG as CONFIG
+from config import (OBS_SIZE, PPO_CLIP_EPS, PPO_ENTROPY_COEF, PPO_EPOCHS,
+                    PPO_EVAL_EVERY, PPO_GAE_LAMBDA, PPO_GAMMA)
+from config import PPO_LOG_PATH as LOG_PATH
+from config import (PPO_LR, PPO_MAX_GRAD_NORM, PPO_MINI_BATCH_SIZE,
+                    PPO_NUM_ITERATIONS, PPO_SAVE_EVERY, PPO_STEPS_PER_ITER,
+                    PPO_VALUE_COEF)
+from config import PPO_WEIGHTS_PATH as SAVE_PATH
+from config import TOLERANCE
+from data.dataloader import get_data
+# from data.dataloader import WEIGHTS_DIR, get_data
 from models.policy_network import ActorCriticNetwork
 from training.ppo import PPOTrainer
 
 # ==========================================
 # CONFIG
 # ==========================================
-SAVE_PATH = str(WEIGHTS_DIR / "ppo_policy.pt")
-IMITATION_WEIGHTS = str(WEIGHTS_DIR / "imitation_policy.pt")
-LOG_PATH = str(WEIGHTS_DIR / "ppo_log.txt")
+# SAVE_PATH = str(WEIGHTS_DIR / "ppo_policy.pt")
+# IMITATION_WEIGHTS = str(WEIGHTS_DIR / "imitation_policy.pt")
+# LOG_PATH = str(WEIGHTS_DIR / "ppo_log.txt")
 
-TOLERANCE = 2.0
-OBS_SIZE = 65
-MAX_STEPS = 2000
-USE_VESSELNESS = False
-LSTM_CHUNK_LENGTH = 32
+# TOLERANCE = 2.0
+# OBS_SIZE = 65
+# MAX_STEPS = 2000
+# USE_VESSELNESS = False
+# LSTM_CHUNK_LENGTH = 32
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CONFIG = {
-    "policy": {
-        "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": True,
-        "dropout": 0.05,
-        "encoder_type": "cnn",
-    },
-    "environment": {
-        "observation_size": OBS_SIZE,
-        "tolerance": TOLERANCE,
-        "use_vesselness": USE_VESSELNESS,
-        "max_steps_per_episode": MAX_STEPS,
-        "max_off_track_streak": 8,
-        "step_size": 1,
-    },
-    "reward": {
-        "alpha_near": 0.1,
-        "beta_coverage": 1.0,
-        "gamma_off": -0.5,
-        "lambda_revisit": -1.0,
-        "step_cost": -0.01,
-        "direction_bonus": 0.05,
-        "terminal_f1_weight": 5.0,
-        "use_potential_shaping": False,
-    },
-    "training": {"ppo": {"gamma": 0.99}},
-}
+# CONFIG = {
+#     "policy": {
+#         "hidden_dim": 128,
+#         "lstm_hidden": 128,
+#         "use_lstm": True,
+#         "dropout": 0.05,
+#         "encoder_type": "cnn",
+#     },
+#     "environment": {
+#         "observation_size": OBS_SIZE,
+#         "tolerance": TOLERANCE,
+#         "use_vesselness": USE_VESSELNESS,
+#         "max_steps_per_episode": MAX_STEPS,
+#         "max_off_track_streak": 8,
+#         "step_size": 1,
+#     },
+#     "reward": {
+#         "alpha_near": 0.1,
+#         "beta_coverage": 1.0,
+#         "gamma_off": -0.5,
+#         "lambda_revisit": -1.0,
+#         "step_cost": -0.01,
+#         "direction_bonus": 0.05,
+#         "terminal_f1_weight": 5.0,
+#         "use_potential_shaping": False,
+#     },
+#     "training": {"ppo": {"gamma": 0.99}},
+# }
 
 
 # ==========================================
@@ -118,26 +131,45 @@ def main():
         return
 
     model = ActorCriticNetwork(CONFIG).to(DEVICE)
+
     trainer = PPOTrainer(
-        model,
-        CONFIG,
-        DEVICE,
-        lr=1e-4,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_eps=0.1,
-        entropy_coef=0.05,
-        value_coef=0.5,
-        max_grad_norm=1.0,
-        ppo_epochs=4,
-        mini_batch_size=256,
-        steps_per_iter=4096,
-        num_iterations=1000,
-        eval_every=25,
-        save_every=50,
+        model, CONFIG, DEVICE,
+        lr=PPO_LR,
+        gamma=PPO_GAMMA,
+        gae_lambda=PPO_GAE_LAMBDA,
+        clip_eps=PPO_CLIP_EPS,
+        entropy_coef=PPO_ENTROPY_COEF,
+        value_coef=PPO_VALUE_COEF,
+        max_grad_norm=PPO_MAX_GRAD_NORM,
+        ppo_epochs=PPO_EPOCHS,
+        mini_batch_size=PPO_MINI_BATCH_SIZE,
+        steps_per_iter=PPO_STEPS_PER_ITER,
+        num_iterations=PPO_NUM_ITERATIONS,
+        eval_every=PPO_EVAL_EVERY,
+        save_every=PPO_SAVE_EVERY,
         tolerance=TOLERANCE,
         lstm_chunk_length=LSTM_CHUNK_LENGTH,
     )
+    # trainer = PPOTrainer(
+    #     model,
+    #     CONFIG,
+    #     DEVICE,
+    #     lr=1e-4,
+    #     gamma=0.99,
+    #     gae_lambda=0.95,
+    #     clip_eps=0.1,
+    #     entropy_coef=0.05,
+    #     value_coef=0.5,
+    #     max_grad_norm=1.0,
+    #     ppo_epochs=4,
+    #     mini_batch_size=256,
+    #     steps_per_iter=4096,
+    #     num_iterations=1000,
+    #     eval_every=25,
+    #     save_every=50,
+    #     tolerance=TOLERANCE,
+    #     lstm_chunk_length=LSTM_CHUNK_LENGTH,
+    # )
 
     trainer.train(
         train_samples=train_samples,

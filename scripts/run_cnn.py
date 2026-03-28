@@ -29,12 +29,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.unet import (CenterlineLoss,
-                                                CenterlinePredictor,
-                                                CenterlineUNet)
 from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
 from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_data, get_test_data
 from evaluation.metrics import CenterlineMetrics
+from models.unet import CenterlineLoss, CenterlinePredictor, CenterlineUNet
 
 # ==========================================
 # CONFIG
@@ -306,6 +304,7 @@ def evaluate_and_visualize(
 # ==========================================
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help="Train the model")
     parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
@@ -319,27 +318,34 @@ if __name__ == "__main__":
 
     if args.train:
         train_ds, train_loader = get_data(
-            "unet", "train", batch_size=BATCH_SIZE,
-            resize=RESIZE, transform=get_train_transforms(),
+            "unet",
+            "train",
+            batch_size=BATCH_SIZE,
+            resize=RESIZE,
+            transform=get_train_transforms(),
         )
         val_ds, val_loader = get_data(
-            "unet", "val", batch_size=1,
+            "unet",
+            "val",
+            batch_size=1,
             resize=RESIZE,
         )
         print(f"[Combined]  train={len(train_ds)}  val={len(val_ds)}")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        model     = CenterlineUNet(**MODEL_CFG).to(DEVICE)
+        model = CenterlineUNet(**MODEL_CFG).to(DEVICE)
         criterion = CenterlineLoss(0.4, 0.6, pos_weight=10.0)
         optimizer = optim.AdamW(model.parameters(), lr=LR)
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
         train_hist, val_hist = [], []
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
 
         print(f"--- Training ({EPOCHS} epochs) ---")
         for epoch in range(1, EPOCHS + 1):
-            t_loss = run_epoch(model, train_loader, criterion, optimizer, DEVICE, "Train")
+            t_loss = run_epoch(
+                model, train_loader, criterion, optimizer, DEVICE, "Train"
+            )
             v_loss = run_epoch(model, val_loader, criterion, None, DEVICE, "Val")
             train_hist.append(t_loss)
             val_hist.append(v_loss)
@@ -349,21 +355,27 @@ if __name__ == "__main__":
                 best_val_loss = v_loss
                 os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
                 torch.save(
-                    {'model_state': model.state_dict(), 'model_cfg': MODEL_CFG},
+                    {"model_state": model.state_dict(), "model_cfg": MODEL_CFG},
                     SAVE_PATH,
                 )
 
             if epoch % 10 == 0 or epoch == 1:
-                print(f"  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}")
+                print(
+                    f"  Epoch {epoch:>3}/{EPOCHS}  train={t_loss:.4f}  val={v_loss:.4f}"
+                )
 
-        plot_loss_curves(train_hist, val_hist, os.path.join(OUTPUT_DIR, "training_val_curves.png"))
+        plot_loss_curves(
+            train_hist, val_hist, os.path.join(OUTPUT_DIR, "training_val_curves.png")
+        )
         print(f"Best val loss: {best_val_loss:.4f}")
 
     if args.eval and os.path.exists(SAVE_PATH):
         val_ds, _ = get_data("unet", "val", batch_size=1, resize=RESIZE)
         val_output_dir = str(_OUTPUT_BASE / "unet" / "val")
         os.makedirs(val_output_dir, exist_ok=True)
-        evaluate_and_visualize(SAVE_PATH, val_ds, split_label="Val", output_dir=val_output_dir)
+        evaluate_and_visualize(
+            SAVE_PATH, val_ds, split_label="Val", output_dir=val_output_dir
+        )
 
     if args.test and os.path.exists(SAVE_PATH):
         for ext_name in TEST_DATASETS:
@@ -374,4 +386,6 @@ if __name__ == "__main__":
                 continue
             ext_output_dir = str(_OUTPUT_BASE / "unet" / ext_name)
             os.makedirs(ext_output_dir, exist_ok=True)
-            evaluate_and_visualize(SAVE_PATH, ext_ds, split_label=ext_name, output_dir=ext_output_dir)
+            evaluate_and_visualize(
+                SAVE_PATH, ext_ds, split_label=ext_name, output_dir=ext_output_dir
+            )

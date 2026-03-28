@@ -1,4 +1,4 @@
-"""scripts/drive_rl_tracing.py
+"""scripts/run_rl_tracing.py
 =========================
 End-to-end inference: SeedDetector → FrontierTracer → F1 evaluation.
 """
@@ -20,107 +20,136 @@ from skimage.morphology import skeletonize
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
-from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_test_data, get_data
-from evaluation.metrics import CenterlineMetrics
+from config import CSV_COLUMNS, DEVICE, DILATION_RADIUS
+from config import INFERENCE_MODE as MODE
+from config import (MAX_STEPS, MAX_TRACES, METRIC_COLS, MIN_COV_GAIN,
+                    N_RING_SEEDS, OBS_SIZE, OUTPUT_BASE, PPO_WEIGHTS_PATH,
+                    RING_INSET_PX, SEED_WEIGHTS_PATH, TOLERANCE,
+                    get_inference_config, get_seed_inference_config)
+from data.dataloader import TEST_DATASETS, get_data, get_test_data
 from environment.frontier_tracer import FrontierTracer
 from environment.seeding_utils import merge_seeds
 from environment.vessel_env import VesselTracingEnv
+# from data.dataloader import OUTPUT_DIR as _OUTPUT_BASE
+# from data.dataloader import TEST_DATASETS, WEIGHTS_DIR, get_test_data, get_data
+from evaluation.metrics import CenterlineMetrics
 from models.policy_network import ActorCriticNetwork
 from models.seed_detector import SeedDetector
 
-# ==========================================
-# MODE — switch between gt and e2e
-# ==========================================
-MODE = "e2e"  # 'gt' | 'e2e'
+INFERENCE_CFG  = get_inference_config()
+SEED_INF_CFG   = get_seed_inference_config()
 
-# ==========================================
-# PATHS
-# ==========================================
-PPO_WEIGHTS = str(WEIGHTS_DIR / "ppo_policy.pt")
-SEED_WEIGHTS = str(WEIGHTS_DIR / "seed_detector.pt")
+# # ==========================================
+# # MODE — switch between gt and e2e
+# # ==========================================
+# MODE = "e2e"  # 'gt' | 'e2e'
 
-TOLERANCE = 2.0
-OBS_SIZE = 65
-MAX_STEPS = 2000
-MAX_TRACES = 80
-MIN_COV_GAIN = 0.001
+# # ==========================================
+# # PATHS
+# # ==========================================
+# PPO_WEIGHTS = str(WEIGHTS_DIR / "ppo_policy.pt")
+# SEED_WEIGHTS = str(WEIGHTS_DIR / "seed_detector.pt")
 
-# Morphological post-processing params
-DILATION_RADIUS = 3
+# TOLERANCE = 2.0
+# OBS_SIZE = 65
+# MAX_STEPS = 2000
+# MAX_TRACES = 80
+# MIN_COV_GAIN = 0.001
 
-# FOV-ring peripheral seeding params
-N_RING_SEEDS = 24
-RING_INSET_PX = 40
+# # Morphological post-processing params
+# DILATION_RADIUS = 3
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# # FOV-ring peripheral seeding params
+# N_RING_SEEDS = 24
+# RING_INSET_PX = 40
 
-# ==========================================
-# METRICS
-# ==========================================
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# # ==========================================
+# # METRICS
+# # ==========================================
 metrics_calc = CenterlineMetrics(tolerance_levels=[1, 2, 3])
 
-# Standardised metric columns — shared across all baseline scripts
-METRIC_COLS = [
-    "iou",
-    "clDice",
-    "betti_0_error_raw",
-    "betti_0_error_postproc",
-    "hd95",
-    "f1@1px",
-    "precision@1px",
-    "recall@1px",
-    "f1@2px",
-    "precision@2px",
-    "recall@2px",
-    "f1@3px",
-    "precision@3px",
-    "recall@3px",
-]
+# # Standardised metric columns — shared across all baseline scripts
+# METRIC_COLS = [
+#     "iou",
+#     "clDice",
+#     "betti_0_error_raw",
+#     "betti_0_error_postproc",
+#     "hd95",
+#     "f1@1px",
+#     "precision@1px",
+#     "recall@1px",
+#     "f1@2px",
+#     "precision@2px",
+#     "recall@2px",
+#     "f1@3px",
+#     "precision@3px",
+#     "recall@3px",
+# ]
 
-CSV_COLUMNS = ["image_id"] + METRIC_COLS
+# CSV_COLUMNS = ["image_id"] + METRIC_COLS
 
-# ==========================================
-# CONFIG
-# ==========================================
+# # ==========================================
+# # CONFIG
+# # ==========================================
 
-PPO_CONFIG = {
-    "policy": {
-        "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": True,
-        "dropout": 0.0,
-        "encoder_type": "cnn",
-    },
-    "environment": {
-        "observation_size": OBS_SIZE,
-        "tolerance": TOLERANCE,
-        "use_vesselness": False,
-        "max_steps_per_episode": 600,
-        "max_off_track_streak": 5,
-        "step_size": 2,
-    },
-    "reward": {
-        "alpha_near": 0.1,
-        "beta_coverage": 1.0,
-        "gamma_off": -0.5,
-        "lambda_revisit": -2.0,
-        "step_cost": -0.01,
-        "direction_bonus": 0.05,
-        "terminal_f1_weight": 5.0,
-        "use_potential_shaping": False,
-    },
-    "training": {"ppo": {"gamma": 0.99}},
-}
+# PPO_CONFIG = {
+#     "policy": {
+#         "hidden_dim": 128,
+#         "lstm_hidden": 128,
+#         "use_lstm": True,
+#         "dropout": 0.0,
+#         "encoder_type": "cnn",
+#     },
+#     "environment": {
+#         "observation_size": OBS_SIZE,
+#         "tolerance": TOLERANCE,
+#         "use_vesselness": False,
+#         "max_steps_per_episode": 600,
+#         "max_off_track_streak": 3,
+#         "step_size": 2,
+#         "momentum": 0.0,
+#     },
+#     "reward": {
+#         "alpha_near": 0.1,
+#         "beta_coverage": 1.0,
+#         "gamma_off": -0.5,
+#         "lambda_revisit": -2.0,
+#         "step_cost": -0.01,
+#         "direction_bonus": 0.05,
+#         "terminal_f1_weight": 5.0,
+#         "use_potential_shaping": False,
+#         "smoothness_weight": 0.4,  # if agent gets stiff lower to 0.2
+#         "oscillation_weight": 0.6,
+#         "oscillation_window": 6,
+#         "off_vessel_distance_weight": 0.3,  # scale penalty by distance from centerline
+#         "bridge_penalty": -3.0,  # penalty per off-track step when bridging back
+#         "betti0_episode_weight": 2.0,  # penalty per unit |B0_pred - B0_gt| at episode end
+#         "local_merge_reward": 1.5,  # reward per component merged at each step
+#         "local_merge_radius": 5,  # local window for merge detection (pixels)
+#         "betti0_check_interval": 50,  # check global Betti-0 every N steps
+#         "betti0_delta_weight": 0.5,  # reward for reducing component count
+#     },
+#     "training": {
+#         "ppo": {"gamma": 0.99,},
+#         "patience": 100,
+#         },
+#     "curriculum": {
+#         "start_difficulty": 0.2,
+#         "end_difficulty": 1.0,
+#         "warmup_steps": 500000,
+#     }
+# }
 
-SEED_CONFIG = {
-    "seed_detector": {
-        "base_ch": 16,
-        "nms_radius": 15,
-        "confidence_threshold": 0.3,
-        "top_k_seeds": MAX_TRACES,
-    }
-}
+# SEED_CONFIG = {
+#     "seed_detector": {
+#         "base_ch": 16,
+#         "nms_radius": 15,
+#         "confidence_threshold": 0.3,
+#         "top_k_seeds": MAX_TRACES,
+#     }
+# }
 
 
 # ==========================================
@@ -202,7 +231,7 @@ def _pick_frontier_seed_gt(gt_centerline, covered, half):
 
 
 def trace_gt_mode(ppo_model, sample):
-    env = VesselTracingEnv(PPO_CONFIG)
+    env = VesselTracingEnv(INFERENCE_CFG)
     env.set_data(
         image=sample["image"],
         centerline=sample["centerline"],
@@ -305,7 +334,7 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
         f"Total: {len(merged)}"
     )
 
-    env = VesselTracingEnv(PPO_CONFIG)
+    env = VesselTracingEnv(INFERENCE_CFG)
     tracer = FrontierTracer(env, ppo_model, DEVICE, obs_size=OBS_SIZE)
 
     combined, paths = tracer.trace_from_seeds(sample, merged)
@@ -457,6 +486,7 @@ def append_csv(csv_path: str, metrics: dict):
 # ==========================================
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval", action="store_true", help="Evaluate on val set")
     parser.add_argument("--test", action="store_true", help="Test on external datasets")
@@ -468,16 +498,16 @@ def main():
     print(f"Device: {DEVICE}  |  Mode: {MODE}  |  Dilation radius: {DILATION_RADIUS}px")
 
     # Load PPO model
-    ppo_ckpt = torch.load(PPO_WEIGHTS, map_location=DEVICE, weights_only=True)
-    ppo_model = ActorCriticNetwork(PPO_CONFIG).to(DEVICE)
+    ppo_ckpt = torch.load(PPO_WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
+    ppo_model = ActorCriticNetwork(INFERENCE_CFG).to(DEVICE)
     ppo_model.load_state_dict(ppo_ckpt["model_state_dict"])
     ppo_model.eval()
 
     # Load seed detector
     seed_model = None
     if MODE == "e2e":
-        seed_ckpt = torch.load(SEED_WEIGHTS, map_location=DEVICE, weights_only=True)
-        seed_model = SeedDetector(SEED_CONFIG).to(DEVICE)
+        seed_ckpt = torch.load(SEED_WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
+        seed_model = SeedDetector(SEED_INF_CFG).to(DEVICE)
         seed_model.load_state_dict(seed_ckpt["model_state_dict"])
         seed_model.eval()
 
@@ -501,7 +531,9 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
                     "id": s["id"],
                     "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
                     "image": s["image"].permute(1, 2, 0).numpy(),
-                    "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
+                    "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(
+                        np.uint8
+                    ),
                     "centerline": s["centerline"].squeeze(0).numpy(),
                     "distance_transform": s["distance_transform"].squeeze(0).numpy(),
                     "fov_mask": s["fov_mask"].squeeze(0).numpy(),
@@ -509,7 +541,7 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
         else:
             samples = _load_all_samples(dataset_name)
 
-        output_dir = str(_OUTPUT_BASE / f"RL_tracing_{MODE}" / dataset_name)
+        output_dir = str(OUTPUT_BASE / f"RL_tracing_{MODE}" / dataset_name)
         os.makedirs(output_dir, exist_ok=True)
 
         csv_path = os.path.join(output_dir, f"metrics_{MODE}.csv")
@@ -534,10 +566,13 @@ def _run_on_datasets(ppo_model, seed_model, dataset_names, label="test"):
             for k in METRIC_COLS:
                 vals = [m[k] for m in all_metrics if k in m]
                 if vals:
-                    print(f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
+                    print(
+                        f"  {k:<28s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}"
+                    )
             print("=" * 65)
 
             import pandas as pd
+
             summary_rows = [
                 {
                     "Metric": k,

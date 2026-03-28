@@ -18,48 +18,57 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
+from config import DEVICE
+from config import IMITATION_BATCH_SIZE as BATCH_SIZE
+from config import IMITATION_LR as LEARNING_RATE
+from config import IMITATION_LSTM_BATCH_SIZE as LSTM_BATCH_SIZE
+from config import IMITATION_NUM_EPOCHS as NUM_EPOCHS
+from config import IMITATION_USE_AUGMENT as USE_AUGMENT
+from config import IMITATION_WEIGHTS_PATH as SAVE_PATH
+from config import MODEL_CONFIG as CONFIG
+from config import OBS_SIZE, TOLERANCE
 from data.centerline_extraction import CenterlineExtractor
-from data.dataloader import WEIGHTS_DIR, get_data
+from data.dataloader import get_data
+# from data.dataloader import WEIGHTS_DIR, get_data
 from models.policy_network import ActorCriticNetwork
-from training.imitation import (
-    ImitationTrainer,
-    augment_sample,
-    generate_expert_pairs,
-    generate_expert_sequences,
-)
+from training.imitation import (ImitationTrainer, augment_sample,
+                                generate_expert_pairs,
+                                generate_expert_sequences)
+
+USE_LSTM = CONFIG["policy"]["use_lstm"]
 
 # ==========================================
 # CONFIG
 # ==========================================
-SAVE_PATH = str(WEIGHTS_DIR / "imitation_policy.pt")
+# SAVE_PATH = str(WEIGHTS_DIR / "imitation_policy.pt")
 
-LEARNING_RATE = 3e-4
-BATCH_SIZE = 128
-LSTM_BATCH_SIZE = 16
-NUM_EPOCHS = 30
-TOLERANCE = 2.0
-OBS_SIZE = 65
-USE_AUGMENT = False
+# LEARNING_RATE = 3e-4
+# BATCH_SIZE = 128
+# LSTM_BATCH_SIZE = 16
+# NUM_EPOCHS = 30
+# TOLERANCE = 2.0
+# OBS_SIZE = 65
+# USE_AUGMENT = False
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CONFIG = {
-    "policy": {
-        "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": True,
-        "dropout": 0.0,
-        "encoder_type": "cnn",
-    },
-    "environment": {
-        "observation_size": OBS_SIZE,
-        "tolerance": TOLERANCE,
-        "use_vesselness": False,
-    },
-    "training": {"ppo": {"gamma": 0.99}},
-}
+# CONFIG = {
+#     "policy": {
+#         "hidden_dim": 128,
+#         "lstm_hidden": 128,
+#         "use_lstm": True,
+#         "dropout": 0.0,
+#         "encoder_type": "cnn",
+#     },
+#     "environment": {
+#         "observation_size": OBS_SIZE,
+#         "tolerance": TOLERANCE,
+#         "use_vesselness": False,
+#     },
+#     "training": {"ppo": {"gamma": 0.99}},
+# }
 
-USE_LSTM = CONFIG["policy"]["use_lstm"]
+# USE_LSTM = CONFIG["policy"]["use_lstm"]
 
 
 # ==========================================
@@ -149,8 +158,10 @@ def main():
     # Train/val split
     # ------------------------------------------------------------------
     if USE_LSTM:
-        print(f"\nTotal sequences: {len(all_sequences)}  "
-              f"(avg length {np.mean([s['length'] for s in all_sequences]):.1f})")
+        print(
+            f"\nTotal sequences: {len(all_sequences)}  "
+            f"(avg length {np.mean([s['length'] for s in all_sequences]):.1f})"
+        )
 
         # Shuffle and split sequences
         indices = np.random.permutation(len(all_sequences))
