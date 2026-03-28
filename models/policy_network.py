@@ -8,7 +8,7 @@ Two forward modes:
   forward_sequence() — T-step chunk with done masks, used during PPO training
 """
 
-from typing import Any, Union, List, Tuple, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -24,11 +24,13 @@ def _compute_in_channels(config: Dict[str, Any]) -> int:
       distance transform : 1
       vessel grad dy     : 1
       vessel grad dx     : 1
-      vesselness         : +1 if use_vesselness=True
+      centerline mask    : 1    ← NEW
+      vessel tangent dy  : 1    ← NEW
+      vessel tangent dx  : 1    ← NEW
 
-    Total (default): 7
+    Total (default): 10
     """
-    n = 3 + 1 + 1 + 1 + 1
+    n = 3 + 1 + 1 + 1 + 1 + 1 + 1 + 1  # 10
     if config.get("environment", {}).get("use_vesselness", False):
         n += 1
     return n
@@ -227,7 +229,9 @@ class ActorCriticNetwork(nn.Module):
         # Near-uniform initial policy
         nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
 
-    def init_hidden(self, batch_size: int = 1, device: Union[torch.device, str] = "cpu"):
+    def init_hidden(
+        self, batch_size: int = 1, device: Union[torch.device, str] = "cpu"
+    ):
         """Create zero hidden state. Returns None when LSTM is disabled."""
         if not self.use_lstm:
             return None

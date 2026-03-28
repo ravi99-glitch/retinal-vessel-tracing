@@ -268,7 +268,6 @@ class GreedyTracerBaseline:
 
         return vesselness.astype(np.float32)
 
-
     # Change extract_centerline signature:
     def extract_centerline(
         self,
@@ -277,15 +276,21 @@ class GreedyTracerBaseline:
         return_vesselness: bool = False,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
         """Args:
-            preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
-            fov_mask          : (H, W) uint8 FOV mask {0, 255}
+        preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
+        fov_mask          : (H, W) uint8 FOV mask {0, 255}
         """
-        mask = fov_mask if fov_mask is not None else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
+        mask = (
+            fov_mask
+            if fov_mask is not None
+            else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
+        )
         vesselness = self._compute_vesselness(preprocessed, mask)
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
         if skeleton.any() and self.min_obj_size > 0:
-            skeleton_bool = remove_small_objects(skeleton > 0, min_size=self.min_obj_size)
+            skeleton_bool = remove_small_objects(
+                skeleton > 0, min_size=self.min_obj_size
+            )
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         if return_vesselness:
