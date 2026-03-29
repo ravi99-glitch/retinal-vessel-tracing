@@ -4,22 +4,6 @@
 
 A reinforcement learning agent for extracting the centerline of retinal blood vessels. The agent was compared against classical and CNN baseline models using multiple datasets.
 
-<table>
-  <tr>
-    <td width="60%">
-
-# Retinal Vessel Tracing
-
-A reinforcement learning agent for extracting the centerline of retinal blood vessels. The agent was compared against classical and CNN baseline models using multiple datasets.
-
-    </td>
-    <td width="40%">
-      <img src="O7.jpeg" width="300"/>
-    </td>
-  </tr>
-</table>
-
-
 ## Overview
 
 This project trains an RL agent to trace blood vessel centerlines in retinal fundus images. The agent learns to navigate along blood vessel structures using a policy, trained via imitation learning followed by PPO fine-tuning. A seed detector predicts starting points, allowing for end-to-end inference without the need for ground-truth labels.
