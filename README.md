@@ -1,3 +1,5 @@
+![Pipeline](/O7.jpeg)
+
 # Retinal Vessel Tracing
 
 A reinforcement learning agent for extracting the centerline of retinal blood vessels. The agent was compared against classical and CNN baseline models using multiple datasets.
