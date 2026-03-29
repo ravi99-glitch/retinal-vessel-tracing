@@ -34,111 +34,128 @@ class ObservationBuilder:
         self.use_vesselness = env_config.get("use_vesselness", False)
         self.tolerance = env_config.get("tolerance", 2.0)
 
+        # Pre-allocate observation buffer
+        self._max_channels = 11 if self.use_vesselness else 10
+        self._obs_buffer = np.zeros(
+            (self._max_channels, self.obs_size, self.obs_size), dtype=np.float32
+        )
+        self._stacked_sources: Optional[np.ndarray] = None  # (H, W, 6)
+
+    def prepare_stacked_sources(
+        self,
+        distance_transform: np.ndarray,
+        dt_gradient: np.ndarray,
+        centerline: np.ndarray,
+        vessel_orientation: np.ndarray,
+    ) -> None:
+        """Pre-stack static per-episode maps into one (H, W, 6) float32 array.
+
+        Call once per episode in set_data(), not per step.
+        Layout: 0=DT  1=grad_y  2=grad_x  3=centerline  4=tangent_y  5=tangent_x
+        """
+        H, W = distance_transform.shape[:2]
+        s = np.empty((H, W, 6), dtype=np.float32)
+        s[:, :, 0] = distance_transform
+        s[:, :, 1] = dt_gradient[:, :, 0]
+        s[:, :, 2] = dt_gradient[:, :, 1]
+        s[:, :, 3] = (centerline > 0).astype(np.float32)
+        s[:, :, 4] = vessel_orientation[:, :, 0]
+        s[:, :, 5] = vessel_orientation[:, :, 1]
+        self._stacked_sources = s
+
+    @staticmethod
+    def compute_dt_gradient(distance_transform: np.ndarray) -> np.ndarray:
+        """Precompute full-image DT gradient. Call once per episode in set_data().
+
+        Returns (H, W, 2) array of [grad_y, grad_x], negated and normalised
+        so vectors point TOWARD the centerline.
+        """
+        dt = distance_transform.astype(np.float32)
+        grad_y, grad_x = np.gradient(dt)
+        grad_y, grad_x = -grad_y, -grad_x  # point toward centerline
+        mag = np.sqrt(grad_y**2 + grad_x**2) + 1e-8
+        grad_y = (grad_y / mag).astype(np.float32)
+        grad_x = (grad_x / mag).astype(np.float32)
+        return np.stack([grad_y, grad_x], axis=-1)  # (H, W, 2)
+
     def build(
         self,
         image: np.ndarray,
         visited_mask: np.ndarray,
         vesselness: Optional[np.ndarray],
         position: np.ndarray,
-        prev_direction: Optional[int],  # kept for API compat, unused
+        prev_direction: Optional[int],
         distance_transform: Optional[np.ndarray] = None,
         centerline: Optional[np.ndarray] = None,
-        vessel_orientation: Optional[np.ndarray] = None,  # (H,W,2)
+        vessel_orientation: Optional[np.ndarray] = None,
+        dt_gradient: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Build observation tensor.
-
-        Args:
-            image:              Full RGB image (H, W, 3), float32 in [0, 1]
-            visited_mask:       Full visited mask (H, W)
-            vesselness:         Optional vesselness response (H, W)
-            position:           Current position [y, x]
-            prev_direction:     Ignored (kept for API compatibility)
-            distance_transform: Distance-to-centerline map (H, W) — required
-
-        Returns:
-            Observation tensor (C, obs_size, obs_size), float32
-
-        """
         y, x = int(position[0]), int(position[1])
-
         y_start = y - self.half_size
         y_end = y + self.half_size + 1
         x_start = x - self.half_size
         x_end = x + self.half_size + 1
 
-        # --- RGB (3 channels) ---
+        buf = self._obs_buffer
+        n = 10
+
+        # --- RGB (channels 0-2) ---
         image_crop = self._crop(image, y_start, y_end, x_start, x_end)
-        rgb = image_crop.transpose(2, 0, 1).astype(np.float32)  # (3,H,W)
+        buf[0:3] = image_crop.transpose(2, 0, 1)
 
-        # --- Visited mask (1 channel) ---
-        vis_crop = self._crop(
-            visited_mask[:, :, np.newaxis], y_start, y_end, x_start, x_end
-        )[:, :, 0]
-        visited_ch = vis_crop[np.newaxis].astype(np.float32)  # (1,H,W)
+        # --- Visited mask (channel 3) ---
+        buf[3] = self._crop(visited_mask, y_start, y_end, x_start, x_end)
 
-        channels = [rgb, visited_ch]
-
-        # --- Distance transform + vessel gradient (3 channels) ---
-        if distance_transform is not None:
-            dt_crop = self._crop(
-                distance_transform[:, :, np.newaxis], y_start, y_end, x_start, x_end
-            )[:, :, 0].astype(np.float32)
-
-            # Channel 4: normalised DT, 0=on centerline, 1=at tolerance boundary
-            dt_norm = np.clip(dt_crop / max(self.tolerance, 1e-6), 0.0, 1.0)
-            channels.append(dt_norm[np.newaxis])  # (1,H,W)
-
-            # Channels 5-6: local vessel direction from DT gradient
-            # gradient points away from centerline; negate so it points TOWARD it
-            grad_y, grad_x = np.gradient(dt_crop)
-            grad_y = -grad_y
-            grad_x = -grad_x
-            mag = np.sqrt(grad_y**2 + grad_x**2) + 1e-8
-            grad_y_norm = (grad_y / mag).astype(np.float32)  # [-1, 1]
-            grad_x_norm = (grad_x / mag).astype(np.float32)  # [-1, 1]
-            channels.append(grad_y_norm[np.newaxis])  # (1,H,W)
-            channels.append(grad_x_norm[np.newaxis])  # (1,H,W)
+        # --- Static channels 4-9 via single crop ---
+        if self._stacked_sources is not None:
+            static_crop = self._crop(
+                self._stacked_sources, y_start, y_end, x_start, x_end
+            )  # (obs, obs, 6)
+            buf[4:10] = static_crop.transpose(2, 0, 1)
+            # Normalise DT channel in-place
+            buf[4] /= max(self.tolerance, 1e-6)
+            np.clip(buf[4], 0.0, 1.0, out=buf[4])
         else:
-            # Fallback: three zero channels so shape is always consistent
-            zeros = np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
-            channels += [zeros, zeros, zeros]
+            # Fallback when prepare_stacked_sources() was not called
+            buf[4:10] = 0
+            if distance_transform is not None:
+                dt_crop = self._crop(
+                    distance_transform, y_start, y_end, x_start, x_end
+                ).astype(np.float32)
+                dt_crop /= max(self.tolerance, 1e-6)
+                np.clip(dt_crop, 0.0, 1.0, out=dt_crop)
+                buf[4] = dt_crop
+                if dt_gradient is not None:
+                    grad_crop = self._crop(dt_gradient, y_start, y_end, x_start, x_end)
+                    buf[5] = grad_crop[:, :, 0]
+                    buf[6] = grad_crop[:, :, 1]
+                else:
+                    raw_dt = self._crop(
+                        distance_transform, y_start, y_end, x_start, x_end
+                    ).astype(np.float32)
+                    gy, gx = np.gradient(raw_dt)
+                    gy, gx = -gy, -gx
+                    mag = np.sqrt(gy**2 + gx**2) + 1e-8
+                    buf[5] = gy / mag
+                    buf[6] = gx / mag
+            if centerline is not None:
+                buf[7] = (
+                    self._crop(centerline, y_start, y_end, x_start, x_end) > 0
+                ).astype(np.float32)
+            if vessel_orientation is not None:
+                orient_crop = self._crop(
+                    vessel_orientation, y_start, y_end, x_start, x_end
+                )
+                buf[8] = orient_crop[:, :, 0]
+                buf[9] = orient_crop[:, :, 1]
 
-        # Centerline binary mask (1 channel)
-        if centerline is not None:
-            cl_crop = self._crop(
-                centerline[:, :, np.newaxis], y_start, y_end, x_start, x_end
-            )[:, :, 0]
-            cl_ch = (cl_crop > 0).astype(np.float32)
-            channels.append(cl_ch[np.newaxis])  # (1,H,W)
-        else:
-            channels.append(
-                np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
-            )
-
-        # Vessel tangent direction (2 channels)
-        if vessel_orientation is not None:
-            orient_crop = self._crop(
-                vessel_orientation, y_start, y_end, x_start, x_end
-            )  # (obs_size, obs_size, 2)
-            channels.append(
-                orient_crop[:, :, 0][np.newaxis].astype(np.float32)
-            )  # tangent_y
-            channels.append(
-                orient_crop[:, :, 1][np.newaxis].astype(np.float32)
-            )  # tangent_x
-        else:
-            zeros = np.zeros((1, self.obs_size, self.obs_size), dtype=np.float32)
-            channels.append(zeros)
-            channels.append(zeros)
-
-        # --- Vesselness (1 channel, optional) ---
+        # --- Vesselness (optional) ---
         if self.use_vesselness and vesselness is not None:
-            v_crop = self._crop(
-                vesselness[:, :, np.newaxis], y_start, y_end, x_start, x_end
-            )[:, :, 0]
-            channels.append(v_crop[np.newaxis].astype(np.float32))  # (1,H,W)
+            buf[n] = self._crop(vesselness, y_start, y_end, x_start, x_end)
+            n += 1
 
-        return np.concatenate(channels, axis=0)  # (C,H,W)
+        # Copy out — buffer is reused across calls
+        return buf[:n].copy()
 
     def _crop(
         self, array: np.ndarray, y_start: int, y_end: int, x_start: int, x_end: int
@@ -166,7 +183,8 @@ class ObservationBuilder:
 
         return crop
 
-    def compute_vessel_orientation(self, image: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def compute_vessel_orientation(image: np.ndarray) -> np.ndarray:
         """Precompute vessel tangent direction from the image structure tensor.
 
         Uses the green channel (best vessel contrast in fundus images).

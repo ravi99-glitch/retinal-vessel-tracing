@@ -106,7 +106,14 @@ class VesselTracingEnv(gym.Env):
         )
 
     def set_data(
-        self, image, centerline, distance_transform, vesselness=None, fov_mask=None
+        self,
+        image,
+        centerline,
+        distance_transform,
+        vesselness=None,
+        fov_mask=None,
+        vessel_orientation=None,
+        dt_gradient=None,
     ):
         self.image = image
         self.centerline = centerline
@@ -114,9 +121,25 @@ class VesselTracingEnv(gym.Env):
         self.vesselness = vesselness
         self.fov_mask = fov_mask if fov_mask is not None else np.ones_like(centerline)
         self.height, self.width = image.shape[:2]
-        self.vessel_orientation = self.observation_builder.compute_vessel_orientation(
-            image
-        )  # precompute vessel orientation (once per image)
+
+        # Use precomputed if provided, else fall back to computing
+        self.vessel_orientation = (
+            vessel_orientation
+            if vessel_orientation is not None
+            else self.observation_builder.compute_vessel_orientation(image)
+        )
+        self.dt_gradient = (
+            dt_gradient
+            if dt_gradient is not None
+            else self.observation_builder.compute_dt_gradient(distance_transform)
+        )
+
+        self.observation_builder.prepare_stacked_sources(
+            distance_transform=distance_transform,
+            dt_gradient=self.dt_gradient,
+            centerline=centerline,
+            vessel_orientation=self.vessel_orientation,
+        )
 
     def reset(self, seed=None, start_position=None, **kwargs):
         super().reset(seed=seed)
@@ -284,12 +307,22 @@ class VesselTracingEnv(gym.Env):
         y_max = min(self.height, y + tol_i + 2)
         x_min = max(0, x - tol_i - 1)
         x_max = min(self.width, x + tol_i + 2)
-        for py in range(y_min, y_max):
-            for px in range(x_min, x_max):
-                if self.centerline[py, px] > 0:
-                    dist = np.sqrt((py - y) ** 2 + (px - x) ** 2)
-                    if dist <= self.tolerance:
-                        self.covered_centerline[py, px] = 1.0
+
+        patch = self.centerline[y_min:y_max, x_min:x_max]
+        if not patch.any():
+            return
+
+        rows = np.arange(y_min, y_max)
+        cols = np.arange(x_min, x_max)
+        dy = rows[:, None] - y  # (H, 1)
+        dx = cols[None, :] - x  # (1, W)
+        within = (dy**2 + dx**2) <= self.tolerance**2
+
+        self.covered_centerline[y_min:y_max, x_min:x_max] = np.where(
+            within & (patch > 0),
+            1.0,
+            self.covered_centerline[y_min:y_max, x_min:x_max],
+        )
 
     def _get_observation(self):
         return self.observation_builder.build(
@@ -301,6 +334,7 @@ class VesselTracingEnv(gym.Env):
             distance_transform=self.distance_transform,
             centerline=self.centerline,
             vessel_orientation=self.vessel_orientation,
+            dt_gradient=self.dt_gradient,
         )
 
     def _get_info(self):
@@ -343,17 +377,35 @@ class VectorizedVesselEnv:
         self.envs = [VesselTracingEnv(config) for _ in range(num_envs)]
         self.current_samples = [None] * num_envs
 
+    def _apply_sample(self, env, sample):
+        """Unpack a dataset sample and call env.set_data()."""
+        env.set_data(
+            image=sample["image"].permute(1, 2, 0).numpy(),
+            centerline=sample["centerline"].squeeze().numpy(),
+            distance_transform=sample["distance_transform"].squeeze().numpy(),
+            fov_mask=sample["fov_mask"].squeeze().numpy(),
+            vessel_orientation=(
+                sample["vessel_orientation"].numpy()
+                if "vessel_orientation" in sample
+                else None
+            ),
+            dt_gradient=(
+                sample["dt_gradient"].numpy() if "dt_gradient" in sample else None
+            ),
+        )
+
     def reset(self):
         observations, infos = [], []
         for i, env in enumerate(self.envs):
             sample = self._get_random_sample()
             self.current_samples[i] = sample
-            env.set_data(
-                image=sample["image"].permute(1, 2, 0).numpy(),
-                centerline=sample["centerline"].squeeze().numpy(),
-                distance_transform=sample["distance_transform"].squeeze().numpy(),
-                fov_mask=sample["fov_mask"].squeeze().numpy(),
-            )
+            self._apply_sample(env, sample)
+            # env.set_data(
+            #     image=sample["image"].permute(1, 2, 0).numpy(),
+            #     centerline=sample["centerline"].squeeze().numpy(),
+            #     distance_transform=sample["distance_transform"].squeeze().numpy(),
+            #     fov_mask=sample["fov_mask"].squeeze().numpy(),
+            # )
             obs, info = env.reset()
             observations.append(obs)
             infos.append(info)
@@ -366,12 +418,13 @@ class VectorizedVesselEnv:
             if terminated or truncated:
                 sample = self._get_random_sample()
                 self.current_samples[i] = sample
-                env.set_data(
-                    image=sample["image"].permute(1, 2, 0).numpy(),
-                    centerline=sample["centerline"].squeeze().numpy(),
-                    distance_transform=sample["distance_transform"].squeeze().numpy(),
-                    fov_mask=sample["fov_mask"].squeeze().numpy(),
-                )
+                self._apply_sample(env, sample)
+                # env.set_data(
+                #     image=sample["image"].permute(1, 2, 0).numpy(),
+                #     centerline=sample["centerline"].squeeze().numpy(),
+                #     distance_transform=sample["distance_transform"].squeeze().numpy(),
+                #     fov_mask=sample["fov_mask"].squeeze().numpy(),
+                # )
                 obs, _ = env.reset()
                 info["terminal_observation"] = obs
             observations.append(obs)

@@ -137,11 +137,6 @@ class RewardCalculator:
         position: Tuple[int, int],
         traced_mask: np.ndarray,
     ) -> float:
-        """Check if the current step merged two previously disconnected
-        traced regions in a local window. O(radius²) — cheap per step.
-
-        Returns positive reward if components were merged, 0 otherwise.
-        """
         y, x = int(position[0]), int(position[1])
         r = self.local_merge_radius
         h, w = traced_mask.shape
@@ -149,22 +144,33 @@ class RewardCalculator:
         y_min, y_max = max(0, y - r), min(h, y + r + 1)
         x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-        patch = traced_mask[y_min:y_max, x_min:x_max].copy()
+        patch = traced_mask[y_min:y_max, x_min:x_max]
+        local_y = y - y_min
+        local_x = x - x_min
 
-        # Count components WITHOUT the current pixel
-        local_y, local_x = y - y_min, x - x_min
-        saved = patch[local_y, local_x]
-        patch[local_y, local_x] = 0
-        _, n_before = ndimage_label(patch > 0)
+        # Skip both labels entirely if current pixel was already visited,
+        # or if there are fewer than 2 filled pixels in the neighbourhood —
+        # merging two components requires at least 2 others to exist.
+        if patch[local_y, local_x] == 0:
+            return 0.0
+        if (patch > 0).sum() < 3:  # current pixel + at least 2 others
+            return 0.0
 
-        # Count components WITH the current pixel
-        patch[local_y, local_x] = 1
-        _, n_after = ndimage_label(patch > 0)
+        # Label the patch WITHOUT the current pixel
+        patch_without = patch.copy()
+        patch_without[local_y, local_x] = 0
+        _, n_before = ndimage_label(patch_without > 0)
+
+        if n_before < 2:
+            return 0.0  # nothing to merge — skip second label entirely
+
+        # Only now pay for the second label
+        patch_with = patch_without.copy()
+        patch_with[local_y, local_x] = 1
+        _, n_after = ndimage_label(patch_with > 0)
 
         merged = n_before - n_after
-        if merged > 0:
-            return self.local_merge_reward * merged
-        return 0.0
+        return self.local_merge_reward * merged if merged > 0 else 0.0
 
     def compute_betti0_episode_reward(
         self,
