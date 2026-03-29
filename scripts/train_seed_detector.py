@@ -32,31 +32,8 @@ from config import SEED_WEIGHTS_PATH as SAVE_PATH
 from config import TOLERANCE
 from data.centerline_extraction import CenterlineExtractor
 from data.dataloader import get_data
-# from data.dataloader import WEIGHTS_DIR, get_data
 from models.seed_detector import SeedDetector
 from training.seed_detector_trainer import SeedDetectorTrainer
-
-# ==========================================
-# CONFIG
-# ==========================================
-# SAVE_PATH = str(WEIGHTS_DIR / "seed_detector.pt")
-
-# TOLERANCE = 2.0
-# SIGMA = 3.0  # Gaussian blob size around each endpoint/junction
-# NUM_EPOCHS = 30
-# BATCH_SIZE = 4  # full 565x584 images — keep small to fit VRAM
-# LR = 1e-4
-
-# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# CONFIG = {
-#     "seed_detector": {
-#         "base_ch": 16,  # UNet channel width — 16 → ~0.5M params
-#         "nms_radius": 10,  # min distance between peaks after NMS
-#         "confidence_threshold": 0.3,  # min heatmap value to count as a seed
-#         "top_k_seeds": 50,  # max seeds returned per image
-#     }
-# }
 
 
 # ==========================================

@@ -29,47 +29,15 @@ from config import MODEL_CONFIG as CONFIG
 from config import OBS_SIZE, TOLERANCE
 from data.centerline_extraction import CenterlineExtractor
 from data.dataloader import get_data
-# from data.dataloader import WEIGHTS_DIR, get_data
 from models.policy_network import ActorCriticNetwork
-from training.imitation import (ImitationTrainer, augment_sample,
-                                generate_expert_pairs,
-                                generate_expert_sequences)
+from training.imitation import (
+    ImitationTrainer,
+    augment_sample,
+    generate_expert_pairs,
+    generate_expert_sequences,
+)
 
 USE_LSTM = CONFIG["policy"]["use_lstm"]
-
-# ==========================================
-# CONFIG
-# ==========================================
-# SAVE_PATH = str(WEIGHTS_DIR / "imitation_policy.pt")
-
-# LEARNING_RATE = 3e-4
-# BATCH_SIZE = 128
-# LSTM_BATCH_SIZE = 16
-# NUM_EPOCHS = 30
-# TOLERANCE = 2.0
-# OBS_SIZE = 65
-# USE_AUGMENT = False
-
-# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# CONFIG = {
-#     "policy": {
-#         "hidden_dim": 128,
-#         "lstm_hidden": 128,
-#         "use_lstm": True,
-#         "dropout": 0.0,
-#         "encoder_type": "cnn",
-#     },
-#     "environment": {
-#         "observation_size": OBS_SIZE,
-#         "tolerance": TOLERANCE,
-#         "use_vesselness": False,
-#     },
-#     "training": {"ppo": {"gamma": 0.99}},
-# }
-
-# USE_LSTM = CONFIG["policy"]["use_lstm"]
-
 
 # ==========================================
 # DATA LOADING (unified dataloader)
@@ -191,9 +159,16 @@ def main():
     # Train
     # ------------------------------------------------------------------
     model = ActorCriticNetwork(CONFIG).to(DEVICE)
+
+    wandb_mode = CONFIG.get("training", {}).get("wandb_mode", "online")
+    os.environ["WANDB_MODE"] = wandb_mode
+    use_wandb = CONFIG.get("training", {}).get("use_wandb", False)
+
     trainer = ImitationTrainer(
         model,
         DEVICE,
+        CONFIG,
+        use_wandb=use_wandb,
         lr=LEARNING_RATE,
         batch_size=BATCH_SIZE,
         num_epochs=NUM_EPOCHS,
