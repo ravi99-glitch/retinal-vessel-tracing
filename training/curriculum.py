@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
-
+from data.centerline_extraction import CenterlineExtractor
 import numpy as np
 
 
@@ -46,6 +46,8 @@ class CurriculumManager:
         self.start_difficulty = curriculum_config.get("start_difficulty", 0.2)
         self.end_difficulty = curriculum_config.get("end_difficulty", 1.0)
         self.warmup_steps = curriculum_config.get("warmup_steps", 500_000)
+
+        self._cfg = curriculum_config
 
         self.current_difficulty = self.start_difficulty
         self.total_steps = 0
@@ -112,24 +114,14 @@ class CurriculumManager:
         self._check_stage_advancement()
 
     def is_episode_successful(self, info: Dict[str, Any]) -> bool:
-        """Heuristic: episode succeeds if long enough and has coverage.
-
-        This drives curriculum advancement.
-
-        Args:
-            info: Episode info dict (must contain ``coverage_ratio``
-                  and ``step_count``).
-
-        Returns:
-            ``True`` if the episode counts as successful for the
-            current stage.
-        """
         coverage = info.get("coverage_ratio", 0.0)
         ep_len = info.get("step_count", 0)
         stage = self.get_current_stage()
 
-        min_length = 20 + int(stage.difficulty * 30)       # 20 → 50
-        min_coverage = 0.005 * (1 + stage.difficulty)      # 0.006 → 0.01
+        base = self._cfg.get("success_min_steps_base", 20)
+        scale = self._cfg.get("success_min_steps_scale", 30)
+        min_length = base + int(stage.difficulty * scale)
+        min_coverage = 0.005 * (1 + stage.difficulty)
 
         return ep_len >= min_length and coverage >= min_coverage
 
@@ -197,7 +189,6 @@ class CurriculumManager:
         Returns:
             Difficulty score in ``[0, 1]``.
         """
-        from data.centerline_extraction import CenterlineExtractor
 
         extractor = CenterlineExtractor()
 
@@ -222,12 +213,13 @@ class CurriculumManager:
         vessel_density = vessel_pixels / total_pixels
         density_difficulty = 1.0 - min(vessel_density * 20, 1.0)
 
-        # --- combined ---
+        weights = self._cfg.get("difficulty_weights", [0.4, 0.3, 0.3])
         difficulty = (
-            0.4 * width_difficulty
-            + 0.3 * junction_difficulty
-            + 0.3 * density_difficulty
+            weights[0] * width_difficulty
+            + weights[1] * junction_difficulty
+            + weights[2] * density_difficulty
         )
+
         return difficulty
 
     # ==================================================================

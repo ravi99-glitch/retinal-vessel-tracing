@@ -20,6 +20,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    import wandb
+
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 # ==========================================
 # ACTION CONSTANTS
 # N=0 NE=1 E=2 SE=3 S=4 SW=5 W=6 NW=7 STOP=8
@@ -426,12 +433,15 @@ class ImitationTrainer:
         self,
         model: nn.Module,
         device: torch.device,
+        config: dict,
         lr: float = 3e-4,
         batch_size: int = 128,
         num_epochs: int = 30,
         lstm_batch_size: int = 16,
+        use_wandb: bool = False,
     ):
         self.model = model
+        self.config = config
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
@@ -441,9 +451,17 @@ class ImitationTrainer:
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=10, gamma=0.5
+            self.optimizer,
+            step_size=config.get("training", {}).get("imitation_lr_step_size", 10),
+            gamma=config.get("training", {}).get("imitation_lr_gamma", 0.5),
         )
         self.criterion = nn.CrossEntropyLoss()
+
+        self.use_wandb = use_wandb and _WANDB_AVAILABLE
+        if self.use_wandb:
+            wandb.init(
+                project="vessel-tracing-imitation", config=config, resume="allow"
+            )
 
     def train(
         self,
@@ -503,8 +521,11 @@ class ImitationTrainer:
         best_val_loss = float("inf")
 
         for epoch in range(1, self.num_epochs + 1):
-            train_loss, train_acc = self._run_epoch_ff(train_loader, train=True)
-            val_loss, val_acc = self._run_epoch_ff(val_loader, train=False)
+            train_loss, train_acc, train_gn = self._run_epoch_ff(
+                train_loader, train=True
+            )
+            val_loss, val_acc, _ = self._run_epoch_ff(val_loader, train=False)
+            current_lr = self.scheduler.get_last_lr()[0]
             self.scheduler.step()
 
             print(
@@ -512,6 +533,19 @@ class ImitationTrainer:
                 f"train_loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
             )
+
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": train_loss,
+                        "train/accuracy": train_acc,
+                        "train/grad_norm": train_gn,
+                        "val/loss": val_loss,
+                        "val/accuracy": val_acc,
+                        "train/lr": current_lr,
+                    },
+                    step=epoch,
+                )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -529,11 +563,16 @@ class ImitationTrainer:
                 print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
 
         print(f"\nDone. Best val_loss={best_val_loss:.4f}  →  {save_path}")
+        if self.use_wandb:
+            wandb.finish()
 
-    def _run_epoch_ff(self, loader: DataLoader, train: bool) -> Tuple[float, float]:
-        """Run one feedforward epoch. Returns (loss, accuracy)."""
+    def _run_epoch_ff(
+        self, loader: DataLoader, train: bool
+    ) -> Tuple[float, float, float]:
+        """Run one feedforward epoch. Returns (loss, accuracy, mean_grad_norm)."""
         self.model.train() if train else self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
+        total_gn, n_updates = 0.0, 0
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
@@ -547,14 +586,25 @@ class ImitationTrainer:
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.get("training", {}).get(
+                            "imitation_max_grad_norm", 1.0
+                        ),
+                    )
                     self.optimizer.step()
+                    total_gn += grad_norm.item()
+                    n_updates += 1
 
                 total_loss += loss.item() * len(action_batch)
                 correct += (logits.argmax(-1) == action_batch).sum().item()
                 total += len(action_batch)
 
-        return total_loss / max(total, 1), correct / max(total, 1)
+        return (
+            total_loss / max(total, 1),
+            correct / max(total, 1),
+            total_gn / max(n_updates, 1),
+        )
 
     # ------------------------------------------------------------------
     # LSTM sequential training
@@ -593,8 +643,11 @@ class ImitationTrainer:
         best_val_loss = float("inf")
 
         for epoch in range(1, self.num_epochs + 1):
-            train_loss, train_acc = self._run_epoch_lstm(train_loader, train=True)
-            val_loss, val_acc = self._run_epoch_lstm(val_loader, train=False)
+            train_loss, train_acc, train_gn = self._run_epoch_lstm(
+                train_loader, train=True
+            )
+            val_loss, val_acc, _ = self._run_epoch_lstm(val_loader, train=False)
+            current_lr = self.scheduler.get_last_lr()[0]
             self.scheduler.step()
 
             print(
@@ -602,6 +655,19 @@ class ImitationTrainer:
                 f"train_loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
             )
+
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": train_loss,
+                        "train/accuracy": train_acc,
+                        "train/grad_norm": train_gn,
+                        "val/loss": val_loss,
+                        "val/accuracy": val_acc,
+                        "train/lr": current_lr,
+                    },
+                    step=epoch,
+                )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -619,21 +685,18 @@ class ImitationTrainer:
                 print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
 
         print(f"\nDone. Best val_loss={best_val_loss:.4f}  →  {save_path}")
+        if self.use_wandb:
+            wandb.finish()
 
-    def _run_epoch_lstm(self, loader: DataLoader, train: bool) -> Tuple[float, float]:
+    def _run_epoch_lstm(
+        self, loader: DataLoader, train: bool
+    ) -> Tuple[float, float, float]:
         """Run one LSTM epoch over padded sequence batches.
-
-        Each batch from the loader (via sequence_collate_fn) contains:
-            observations : (T_max, B, C, H, W)
-            actions      : (T_max, B)
-            mask         : (T_max, B)  — valid-step mask
-            dones        : (T_max, B)  — end-of-sequence markers
-
-        Uses model.forward_sequence() for sequential processing
-        and masked cross-entropy for the loss.
+        Returns (loss, accuracy, mean_grad_norm).
         """
         self.model.train() if train else self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
+        total_gn, n_updates = 0.0, 0
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
@@ -645,14 +708,10 @@ class ImitationTrainer:
 
                 T, B = obs_seq.shape[:2]
 
-                # Fresh hidden state for each batch
                 init_state = self.model.init_hidden(batch_size=B, device=self.device)
-
-                # Sequential forward through the whole padded sequence
                 logits_seq, _ = self.model.forward_sequence(obs_seq, init_state, dones)
                 # logits_seq: (T, B, N_ACTIONS)
 
-                # Masked cross-entropy
                 logits_flat = logits_seq.reshape(T * B, -1)
                 actions_flat = actions.reshape(T * B)
                 mask_flat = mask.reshape(T * B)
@@ -665,14 +724,24 @@ class ImitationTrainer:
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.get("training", {}).get(
+                            "imitation_max_grad_norm", 1.0
+                        ),
+                    )
                     self.optimizer.step()
+                    total_gn += grad_norm.item()
+                    n_updates += 1
 
-                # Masked accuracy
                 preds = logits_seq.argmax(dim=-1)  # (T, B)
                 valid_steps = mask.sum().item()
                 correct += ((preds == actions) * mask).sum().item()
                 total_loss += loss.item() * valid_steps
                 total += valid_steps
 
-        return total_loss / max(total, 1), correct / max(total, 1)
+        return (
+            total_loss / max(total, 1),
+            correct / max(total, 1),
+            total_gn / max(n_updates, 1),
+        )

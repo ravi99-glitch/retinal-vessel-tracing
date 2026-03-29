@@ -24,6 +24,13 @@ import torch.optim as optim
 
 from training.curriculum import CurriculumManager
 
+try:
+    import wandb
+
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 # ==========================================
 # ROLLOUT BUFFER  (LSTM-aware)
 # ==========================================
@@ -76,22 +83,28 @@ class RolloutBuffer:
     def compute_returns_and_advantages(
         self, last_value: float, gamma: float, gae_lambda: float
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        rewards = self.rewards
-        values = self.values + [last_value]
-        dones = self.dones
+        n = len(self.rewards)
+        advantages = np.empty(n, dtype=np.float32)
 
-        advantages = []
+        rewards = np.asarray(self.rewards, dtype=np.float32)
+        values = np.asarray(self.values, dtype=np.float32)
+        dones = np.asarray(self.dones, dtype=np.float32)
+
         gae = 0.0
+        next_value = last_value
+        for t in range(n - 1, -1, -1):
+            not_done = 1.0 - dones[t]
+            delta = rewards[t] + gamma * next_value * not_done - values[t]
+            gae = delta + gamma * gae_lambda * not_done * gae
+            advantages[t] = gae
+            next_value = values[t]
 
-        for t in reversed(range(len(rewards))):
-            delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
-            gae = delta + gamma * gae_lambda * (1 - dones[t]) * gae
-            advantages.insert(0, gae)
-
-        advantages = torch.tensor(advantages, dtype=torch.float32)
-        returns = advantages + torch.tensor(self.values, dtype=torch.float32)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return returns, advantages
+        advantages_t = torch.from_numpy(advantages)
+        returns = advantages_t + torch.from_numpy(values)
+        advantages_t = (advantages_t - advantages_t.mean()) / (
+            advantages_t.std() + 1e-8
+        )
+        return returns, advantages_t
 
     def get_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = torch.tensor(np.array(self.obs), dtype=torch.float32)
@@ -111,7 +124,7 @@ def evaluate(
     config: dict,
     device: torch.device,
     tolerance: float,
-    n_episodes: int = 5,
+    n_episodes: int = 1,
 ) -> Dict[str, float]:
     """Run n greedy episodes per val sample.
     Returns mean_coverage and mean_f1.
@@ -237,6 +250,7 @@ class PPOTrainer:
         save_every: int = 50,
         tolerance: float = 2.0,
         lstm_chunk_length: int = 32,
+        use_wandb: bool = False,
     ):
         self.model = model
         self.config = config
@@ -256,22 +270,31 @@ class PPOTrainer:
         self.tolerance = tolerance
         self.lstm_chunk_length = lstm_chunk_length
         self.use_lstm = getattr(model, "use_lstm", False)
+        self.value_clamp = config.get("training", {}).get("value_clamp", 10.0)
 
         # curriculum manager
         self.curriculum = CurriculumManager(config)
-        self.reward_normalizer = RunningRewardNormalizer()
+        self.reward_normalizer = RunningRewardNormalizer(
+            clip=config.get("training", {}).get("reward_norm_clip", 10.0)
+        )
 
         # early stopping patience
         self.patience = config.get("training", {}).get("patience", 100)
         self.no_improve_count = 0
 
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
+
+        # LinearLR end_factor (line ~269)
         self.scheduler = optim.lr_scheduler.LinearLR(
             self.optimizer,
             start_factor=1.0,
-            end_factor=0.1,
+            end_factor=config.get("training", {}).get("lr_end_factor", 0.1),
             total_iters=num_iterations,
         )
+
+        self.use_wandb = use_wandb and _WANDB_AVAILABLE
+        if self.use_wandb:
+            wandb.init(project="vessel-tracing", config=config, resume="allow")
 
     def _apply_curriculum_overrides(self, env):
         """Push current curriculum stage settings into env and reward calculator."""
@@ -313,7 +336,7 @@ class PPOTrainer:
         actions = actions.to(self.device)
         old_log_probs = old_log_probs.to(self.device)
 
-        total_p, total_v, total_e, n = 0.0, 0.0, 0.0, 0
+        total_p, total_v, total_e, total_kl, total_gn, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
         dataset_size = len(obs)
 
         for _ in range(self.ppo_epochs):
@@ -327,6 +350,13 @@ class PPOTrainer:
                 entropy = dist.entropy().mean()
 
                 ratio = torch.exp(log_prob - old_log_probs[idx])
+
+                with torch.no_grad():
+                    approx_kl = (
+                        ((ratio - 1) - (log_prob - old_log_probs[idx])).mean().item()
+                    )
+                    total_kl += approx_kl
+
                 surr1 = ratio * advantages[idx]
                 surr2 = (
                     torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
@@ -335,15 +365,18 @@ class PPOTrainer:
                 p_loss = -torch.min(surr1, surr2).mean()
 
                 v_loss = nn.functional.mse_loss(
-                    torch.clamp(values, -10.0, 10.0),
-                    torch.clamp(returns[idx], -10.0, 10.0),
+                    torch.clamp(values, -self.value_clamp, self.value_clamp),
+                    torch.clamp(returns[idx], -self.value_clamp, self.value_clamp),
                 )
 
                 loss = p_loss + self.value_coef * v_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm
+                )
+                total_gn += grad_norm.item()
                 self.optimizer.step()
 
                 total_p += p_loss.item()
@@ -351,10 +384,19 @@ class PPOTrainer:
                 total_e += entropy.item()
                 n += 1
 
+        with torch.no_grad():
+            values_all = torch.tensor(buffer.values, dtype=torch.float32)
+            ev = (
+                1 - (returns.cpu() - values_all).var() / (returns.cpu().var() + 1e-8)
+            ).item()
+
         return {
             "policy_loss": total_p / max(n, 1),
             "value_loss": total_v / max(n, 1),
             "entropy": total_e / max(n, 1),
+            "approx_kl": total_kl / max(n, 1),
+            "grad_norm": total_gn / max(n, 1),
+            "explained_variance": ev,
         }
 
     # ------------------------------------------------------------------
@@ -394,7 +436,7 @@ class PPOTrainer:
             if e - s >= 2:
                 chunk_indices.append((s, e))
 
-        total_p, total_v, total_e, n = 0.0, 0.0, 0.0, 0
+        total_p, total_v, total_e, total_kl, total_gn, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
 
         for _ in range(self.ppo_epochs):
             perm = torch.randperm(len(chunk_indices))
@@ -437,6 +479,11 @@ class PPOTrainer:
                 entropy = dist.entropy().mean()
 
                 ratio = torch.exp(log_prob - chunk_old_lp)
+
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - (log_prob - chunk_old_lp)).mean().item()
+                    total_kl += approx_kl
+
                 surr1 = ratio * chunk_advs
                 surr2 = (
                     torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
@@ -445,15 +492,18 @@ class PPOTrainer:
                 p_loss = -torch.min(surr1, surr2).mean()
 
                 v_loss = nn.functional.mse_loss(
-                    torch.clamp(values_flat, -10.0, 10.0),
-                    torch.clamp(chunk_returns, -10.0, 10.0),
+                    torch.clamp(values_flat, -self.value_clamp, self.value_clamp),
+                    torch.clamp(chunk_returns, -self.value_clamp, self.value_clamp),
                 )
 
                 loss = p_loss + self.value_coef * v_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm
+                )
+                total_gn += grad_norm.item()
                 self.optimizer.step()
 
                 total_p += p_loss.item()
@@ -461,10 +511,19 @@ class PPOTrainer:
                 total_e += entropy.item()
                 n += 1
 
+        with torch.no_grad():
+            values_all = torch.tensor(buffer.values, dtype=torch.float32)
+            ev = (
+                1 - (returns.cpu() - values_all).var() / (returns.cpu().var() + 1e-8)
+            ).item()
+
         return {
             "policy_loss": total_p / max(n, 1),
             "value_loss": total_v / max(n, 1),
             "entropy": total_e / max(n, 1),
+            "approx_kl": total_kl / max(n, 1),
+            "grad_norm": total_gn / max(n, 1),
+            "explained_variance": ev,
         }
 
     # ------------------------------------------------------------------
@@ -529,10 +588,10 @@ class PPOTrainer:
         """Full PPO training loop with LSTM support.
 
         When use_lstm=True:
-          - Hidden state is carried step-by-step during rollout
-          - Hidden state is reset when episodes end (done=True)
-          - Each step stores the LSTM state *before* the action
-          - PPO update splits rollout into sequential chunks and uses
+        - Hidden state is carried step-by-step during rollout
+        - Hidden state is reset when episodes end (done=True)
+        - Each step stores the LSTM state *before* the action
+        - PPO update splits rollout into sequential chunks and uses
             forward_sequence() with done masks for hidden state resets
         """
         from environment.vessel_env import VesselTracingEnv
@@ -559,14 +618,10 @@ class PPOTrainer:
         ep_reward = 0.0
         ep_length = 0
 
-        # Initialize LSTM hidden state (returns None when use_lstm=False)
         lstm_state = self.model.init_hidden(batch_size=1, device=self.device)
 
-        # apply initial curriculum stage
         self._apply_curriculum_overrides(env)
-        stage_name = self.curriculum.get_current_stage().name
-        print(f"Starting curriculum stage: {stage_name}")
-
+        print(f"Starting curriculum stage: {self.curriculum.get_current_stage().name}")
         print(
             f"\nStarting PPO — iters {start_iteration}–{self.num_iterations} "
             f"× {self.steps_per_iter} steps"
@@ -590,9 +645,6 @@ class PPOTrainer:
                 next_obs, reward, terminated, truncated, info = env.step(action.item())
                 done = terminated or truncated
 
-                # Store transition with LSTM state *before* this step
-
-                # Normalise reward instead of hard clip
                 self.reward_normalizer.update(reward)
                 norm_reward = self.reward_normalizer.normalize(reward)
 
@@ -615,25 +667,30 @@ class PPOTrainer:
                     episode_rewards.append(ep_reward)
                     episode_lengths.append(ep_length)
 
-                    # ── Curriculum: report success and advance ────
                     success = self.curriculum.is_episode_successful(info)
                     prev_stage = self.curriculum.current_stage_idx
                     self.curriculum.step(success=success)
+
                     if self.curriculum.current_stage_idx != prev_stage:
                         self._apply_curriculum_overrides(env)
-                        print(
-                            f"  → Curriculum stage: "
-                            f"{self.curriculum.get_current_stage().name}"
-                        )
+                        stage = self.curriculum.get_current_stage()
+                        print(f"  → Curriculum stage: {stage.name}")
+                        if self.use_wandb:
+                            wandb.log(
+                                {
+                                    "curriculum/stage": stage.name,
+                                    "curriculum/max_off_track": stage.max_off_track_streak,
+                                    "curriculum/entropy_coef": stage.entropy_coef,
+                                },
+                                step=iteration,
+                            )
 
                     ep_reward = 0.0
                     ep_length = 0
-
                     lstm_state = self.model.init_hidden(
                         batch_size=1, device=self.device
                     )
 
-                    # ── Sample filtered by curriculum difficulty ──
                     filtered = self.curriculum.filter_samples(
                         train_samples,
                         get_difficulty=lambda s: self.curriculum.compute_sample_difficulty(
@@ -650,41 +707,6 @@ class PPOTrainer:
                     self._apply_curriculum_overrides(env)
                     obs, _ = env.reset()
 
-                # buffer.add(
-                #     obs,
-                #     action.item(),
-                #     log_prob.item(),
-                #     np.clip(reward, -1.0, 1.0),
-                #     value.item(),
-                #     float(done),
-                #     lstm_state,
-                # )
-
-                # ep_reward += reward
-                # ep_length += 1
-                # obs = next_obs
-                # lstm_state = new_lstm_state
-
-                # if done:
-                #     episode_rewards.append(ep_reward)
-                #     episode_lengths.append(ep_length)
-                #     ep_reward = 0.0
-                #     ep_length = 0
-
-                #     # Reset LSTM state for new episode
-                #     lstm_state = self.model.init_hidden(
-                #         batch_size=1, device=self.device
-                #     )
-
-                #     current = np.random.choice(train_samples)
-                #     env.set_data(
-                #         image=current["image"],
-                #         centerline=current["centerline"],
-                #         distance_transform=current["distance_transform"],
-                #         fov_mask=current["fov_mask"],
-                #     )
-                #     obs, _ = env.reset()
-
             # Bootstrap value for GAE
             with torch.no_grad():
                 obs_t = (
@@ -695,6 +717,7 @@ class PPOTrainer:
             # --- Update ---
             self.model.train()
             stats = self._ppo_update(buffer, last_value)
+            current_lr = self.scheduler.get_last_lr()[0]
             self.scheduler.step()
 
             # --- Log ---
@@ -707,6 +730,24 @@ class PPOTrainer:
                 f"v_loss={stats['value_loss']:6.4f}  "
                 f"entropy={stats['entropy']:.3f}"
             )
+
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "train/policy_loss": stats["policy_loss"],
+                        "train/value_loss": stats["value_loss"],
+                        "train/entropy": stats["entropy"],
+                        "train/approx_kl": stats["approx_kl"],
+                        "train/explained_variance": stats["explained_variance"],
+                        "train/grad_norm": stats["grad_norm"],
+                        "train/mean_reward": mean_reward,
+                        "train/mean_ep_length": mean_length,
+                        "train/lr": current_lr,
+                        "curriculum/stage": self.curriculum.get_current_stage().name,
+                        "curriculum/entropy_coef": self.entropy_coef,
+                    },
+                    step=iteration,
+                )
 
             # --- Eval ---
             if iteration % self.eval_every == 0 and val_samples:
@@ -725,6 +766,15 @@ class PPOTrainer:
                     f"  stage={stage.name}"
                     f"  ent_c={self.entropy_coef:.3f}"
                 )
+
+                if self.use_wandb:
+                    wandb.log(
+                        {
+                            "eval/mean_f1": ev["mean_f1"],
+                            "eval/mean_coverage": ev["mean_coverage"],
+                        },
+                        step=iteration,
+                    )
 
                 if ev["mean_f1"] > best_f1:
                     best_f1 = ev["mean_f1"]
@@ -745,7 +795,6 @@ class PPOTrainer:
                 else:
                     self.no_improve_count += 1
 
-                # ── Early stopping ────────────────────────────
                 if self.no_improve_count >= self.patience:
                     print(log)
                     print(
@@ -753,34 +802,6 @@ class PPOTrainer:
                         f"{self.patience} eval cycles."
                     )
                     break
-
-            # if iteration % self.eval_every == 0 and val_samples:
-            #     ev = evaluate(
-            #         self.model,
-            #         val_samples,
-            #         self.config,
-            #         self.device,
-            #         self.tolerance,
-            #     )
-            #     log += (
-            #         f"  |  val_coverage={ev['mean_coverage']:.3f}"
-            #         f"  val_f1={ev['mean_f1']:.3f}"
-            #     )
-
-            #     if ev["mean_f1"] > best_f1:
-            #         best_f1 = ev["mean_f1"]
-            #         torch.save(
-            #             {
-            #                 "iteration": iteration,
-            #                 "model_state_dict": self.model.state_dict(),
-            #                 "optimizer_state_dict": self.optimizer.state_dict(),
-            #                 "scheduler_state_dict": self.scheduler.state_dict(),
-            #                 "best_f1": best_f1,
-            #                 "config": self.config,
-            #             },
-            #             save_path,
-            #         )
-            #         log += f"  ✓ saved (best F1={best_f1:.3f})"
 
             print(log)
             log_lines.append(log)
@@ -802,6 +823,234 @@ class PPOTrainer:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("\n".join(log_lines))
 
+        if self.use_wandb:
+            wandb.finish()
+
         print(f"\nDone. Best F1: {best_f1:.3f}")
         print(f"Weights: {save_path}")
         print(f"Log:     {log_path}")
+
+    # def train(
+    #     self,
+    #     train_samples: List[Dict],
+    #     val_samples: List[Dict],
+    #     save_path: str,
+    #     log_path: str,
+    #     imitation_path: str = "",
+    # ) -> None:
+    #     """Full PPO training loop with LSTM support.
+
+    #     When use_lstm=True:
+    #       - Hidden state is carried step-by-step during rollout
+    #       - Hidden state is reset when episodes end (done=True)
+    #       - Each step stores the LSTM state *before* the action
+    #       - PPO update splits rollout into sequential chunks and uses
+    #         forward_sequence() with done masks for hidden state resets
+    #     """
+    #     from environment.vessel_env import VesselTracingEnv
+
+    #     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    #     start_iteration, best_f1 = self.load_checkpoint(save_path, imitation_path)
+
+    #     env = VesselTracingEnv(self.config)
+    #     buffer = RolloutBuffer()
+    #     episode_rewards: deque = deque(maxlen=50)
+    #     episode_lengths: deque = deque(maxlen=50)
+    #     log_lines: List[str] = []
+
+    #     # Initial episode setup
+    #     current = np.random.choice(train_samples)
+    #     env.set_data(
+    #         image=current["image"],
+    #         centerline=current["centerline"],
+    #         distance_transform=current["distance_transform"],
+    #         fov_mask=current["fov_mask"],
+    #     )
+    #     obs, _ = env.reset()
+    #     ep_reward = 0.0
+    #     ep_length = 0
+
+    #     # Initialize LSTM hidden state (returns None when use_lstm=False)
+    #     lstm_state = self.model.init_hidden(batch_size=1, device=self.device)
+
+    #     # apply initial curriculum stage
+    #     self._apply_curriculum_overrides(env)
+    #     stage_name = self.curriculum.get_current_stage().name
+    #     print(f"Starting curriculum stage: {stage_name}")
+
+    #     print(
+    #         f"\nStarting PPO — iters {start_iteration}–{self.num_iterations} "
+    #         f"× {self.steps_per_iter} steps"
+    #         f"  LSTM={'ON chunk_len=' + str(self.lstm_chunk_length) if self.use_lstm else 'OFF'}\n"
+    #     )
+
+    #     for iteration in range(start_iteration, self.num_iterations + 1):
+    #         buffer.reset()
+    #         self.model.eval()
+
+    #         # --- Collect rollout ---
+    #         for _ in range(self.steps_per_iter):
+    #             obs_t = (
+    #                 torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+    #             )
+    #             with torch.no_grad():
+    #                 action, log_prob, _, value, new_lstm_state = (
+    #                     self.model.get_action_and_value(obs_t, lstm_state)
+    #                 )
+
+    #             next_obs, reward, terminated, truncated, info = env.step(action.item())
+    #             done = terminated or truncated
+
+    #             # Store transition with LSTM state *before* this step
+
+    #             # Normalise reward instead of hard clip
+    #             self.reward_normalizer.update(reward)
+    #             norm_reward = self.reward_normalizer.normalize(reward)
+
+    #             buffer.add(
+    #                 obs,
+    #                 action.item(),
+    #                 log_prob.item(),
+    #                 norm_reward,
+    #                 value.item(),
+    #                 float(done),
+    #                 lstm_state,
+    #             )
+
+    #             ep_reward += reward
+    #             ep_length += 1
+    #             obs = next_obs
+    #             lstm_state = new_lstm_state
+
+    #             if done:
+    #                 episode_rewards.append(ep_reward)
+    #                 episode_lengths.append(ep_length)
+
+    #                 # ── Curriculum: report success and advance ────
+    #                 success = self.curriculum.is_episode_successful(info)
+    #                 prev_stage = self.curriculum.current_stage_idx
+    #                 self.curriculum.step(success=success)
+    #                 if self.curriculum.current_stage_idx != prev_stage:
+    #                     self._apply_curriculum_overrides(env)
+    #                     print(
+    #                         f"  → Curriculum stage: "
+    #                         f"{self.curriculum.get_current_stage().name}"
+    #                     )
+
+    #                 ep_reward = 0.0
+    #                 ep_length = 0
+
+    #                 lstm_state = self.model.init_hidden(
+    #                     batch_size=1, device=self.device
+    #                 )
+
+    #                 # ── Sample filtered by curriculum difficulty ──
+    #                 filtered = self.curriculum.filter_samples(
+    #                     train_samples,
+    #                     get_difficulty=lambda s: self.curriculum.compute_sample_difficulty(
+    #                         s["centerline"], s.get("vessel_mask", s["centerline"])
+    #                     ),
+    #                 )
+    #                 current = np.random.choice(filtered)
+    #                 env.set_data(
+    #                     image=current["image"],
+    #                     centerline=current["centerline"],
+    #                     distance_transform=current["distance_transform"],
+    #                     fov_mask=current["fov_mask"],
+    #                 )
+    #                 self._apply_curriculum_overrides(env)
+    #                 obs, _ = env.reset()
+
+    #         # Bootstrap value for GAE
+    #         with torch.no_grad():
+    #             obs_t = (
+    #                 torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+    #             )
+    #             last_value = self.model.get_value(obs_t, lstm_state).item()
+
+    #         # --- Update ---
+    #         self.model.train()
+    #         stats = self._ppo_update(buffer, last_value)
+    #         self.scheduler.step()
+
+    #         # --- Log ---
+    #         mean_reward = np.mean(episode_rewards) if episode_rewards else 0.0
+    #         mean_length = np.mean(episode_lengths) if episode_lengths else 0.0
+    #         log = (
+    #             f"Iter {iteration:4d}/{self.num_iterations}  "
+    #             f"reward={mean_reward:7.3f}  ep_len={mean_length:6.1f}  "
+    #             f"p_loss={stats['policy_loss']:7.4f}  "
+    #             f"v_loss={stats['value_loss']:6.4f}  "
+    #             f"entropy={stats['entropy']:.3f}"
+    #         )
+
+    #         # --- Eval ---
+    #         if iteration % self.eval_every == 0 and val_samples:
+    #             ev = evaluate(
+    #                 self.model,
+    #                 val_samples,
+    #                 self.config,
+    #                 self.device,
+    #                 self.tolerance,
+    #             )
+
+    #             stage = self.curriculum.get_current_stage()
+    #             log += (
+    #                 f"  |  val_cov={ev['mean_coverage']:.3f}"
+    #                 f"  val_f1={ev['mean_f1']:.3f}"
+    #                 f"  stage={stage.name}"
+    #                 f"  ent_c={self.entropy_coef:.3f}"
+    #             )
+
+    #             if ev["mean_f1"] > best_f1:
+    #                 best_f1 = ev["mean_f1"]
+    #                 self.no_improve_count = 0
+    #                 torch.save(
+    #                     {
+    #                         "iteration": iteration,
+    #                         "model_state_dict": self.model.state_dict(),
+    #                         "optimizer_state_dict": self.optimizer.state_dict(),
+    #                         "scheduler_state_dict": self.scheduler.state_dict(),
+    #                         "best_f1": best_f1,
+    #                         "config": self.config,
+    #                         "curriculum_stage": self.curriculum.current_stage_idx,
+    #                     },
+    #                     save_path,
+    #                 )
+    #                 log += f"  ✓ saved (best F1={best_f1:.3f})"
+    #             else:
+    #                 self.no_improve_count += 1
+
+    #             # ── Early stopping ────────────────────────────
+    #             if self.no_improve_count >= self.patience:
+    #                 print(log)
+    #                 print(
+    #                     f"\nEarly stopping: no improvement for "
+    #                     f"{self.patience} eval cycles."
+    #                 )
+    #                 break
+
+    #         print(log)
+    #         log_lines.append(log)
+
+    #         # --- Periodic checkpoint ---
+    #         if iteration % self.save_every == 0:
+    #             ckpt_path = save_path.replace(".pt", f"_iter{iteration}.pt")
+    #             torch.save(
+    #                 {
+    #                     "iteration": iteration,
+    #                     "model_state_dict": self.model.state_dict(),
+    #                     "optimizer_state_dict": self.optimizer.state_dict(),
+    #                     "scheduler_state_dict": self.scheduler.state_dict(),
+    #                     "config": self.config,
+    #                 },
+    #                 ckpt_path,
+    #             )
+
+    #     with open(log_path, "w", encoding="utf-8") as f:
+    #         f.write("\n".join(log_lines))
+
+    #     print(f"\nDone. Best F1: {best_f1:.3f}")
+    #     print(f"Weights: {save_path}")
+    #     print(f"Log:     {log_path}")
