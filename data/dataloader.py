@@ -38,11 +38,11 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import (ConcatDataset, DataLoader, Dataset,
-                              WeightedRandomSampler)
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
 
 from .centerline_extraction import CenterlineExtractor
 from .fundus_preprocessor import FundusPreprocessor
+from environment.observation import ObservationBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ _PROJECT_ROOT = _DATA_BASE.parent
 WEIGHTS_DIR = _PROJECT_ROOT / "weights"
 OUTPUT_DIR = _PROJECT_ROOT / "results"
 
-MAX_SAMPLES = 5
+MAX_SAMPLES = 1
 
 
 def get_root(dataset_name: str) -> Path:
@@ -217,7 +217,7 @@ class RetinalFundusDataset(Dataset):
         transform=None,
         fundus_preprocessor: Optional[FundusPreprocessor] = None,
         centerline_extractor: Optional[CenterlineExtractor] = None,
-        max_samples: Optional[int] = None,  
+        max_samples: Optional[int] = None,
     ):
         if target not in VALID_TARGETS:
             raise ValueError(f"target must be one of {VALID_TARGETS}, got '{target}'")
@@ -262,6 +262,8 @@ class RetinalFundusDataset(Dataset):
         if cache_centerlines and self.resize is None:
             self._cache_dir = self.root / "centerlines_cache"
             self._cache_dir.mkdir(exist_ok=True)
+
+        self._vo_mem: Dict[str, np.ndarray] = {}
 
         logger.info(
             "%s  %d samples  target=%s  split=%s",
@@ -351,6 +353,22 @@ class RetinalFundusDataset(Dataset):
             np.save(self._cache_dir / f"{sid}_cl.npy", cl)
         return cl
 
+    def _get_vessel_orientation(self, sid: str, image: np.ndarray) -> np.ndarray:
+        """Return cached vessel orientation, computing + persisting on first call."""
+        if sid in self._vo_mem:
+            return self._vo_mem[sid]
+        if self._cache_dir is not None:
+            cache_file = self._cache_dir / f"{sid}_vessel_orientation.npy"
+            if cache_file.exists():
+                vo = np.load(cache_file)
+                self._vo_mem[sid] = vo
+                return vo
+        vo = ObservationBuilder.compute_vessel_orientation(image)
+        self._vo_mem[sid] = vo
+        if self._cache_dir is not None:
+            np.save(self._cache_dir / f"{sid}_vessel_orientation.npy", vo)
+        return vo
+
     # -- FOV mask ----------------------------------------------------------
 
     def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
@@ -362,7 +380,9 @@ class RetinalFundusDataset(Dataset):
         return self.fundus_preprocessor.create_fov_mask(green)
 
     # -- Resize ------------------------------------------------------------
-    def _maybe_resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
+    def _maybe_resize(
+        self, *arrays: np.ndarray, interp: Optional[List[int]] = None
+    ) -> Tuple[np.ndarray, ...]:
         if self.resize is None:
             return arrays
         target_h, target_w = self.resize
@@ -393,7 +413,7 @@ class RetinalFundusDataset(Dataset):
             else:
                 padded = np.zeros((target_h, target_w), dtype=arr.dtype)
 
-            padded[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+            padded[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
             out.append(padded)
 
         return tuple(out)
@@ -455,8 +475,8 @@ class RetinalFundusDataset(Dataset):
         cl = self._get_centerline(sid, vessel)
         return {
             "id": sid,
-            "image": rgb,                                      
-            "preprocessed": preprocessed,                     
+            "image": rgb,
+            "preprocessed": preprocessed,
             "vessel_mask": (vessel * 255).astype(np.uint8),
             "centerline": (cl * 255).astype(np.uint8),
             "fov_mask": fov,
@@ -474,12 +494,18 @@ class RetinalFundusDataset(Dataset):
         img_orig = img_f.copy()
 
         ext_mask = fov if fov.max() > 0 else None
-        enhanced_green = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
+        enhanced_green = self.fundus_preprocessor.preprocess(
+            rgb, external_mask=ext_mask
+        )
         img_f[:, :, 1] = enhanced_green
 
         cl = self._get_centerline(sid, vessel)
         dt = self.cl_extractor.compute_distance_transform(cl, self.tolerance)
         fov_f = (fov > 0).astype(np.float32)
+
+        # Precompute per-image arrays (vessel_orientation is disk-cached)
+        vessel_orientation = self._get_vessel_orientation(sid, img_f)
+        dt_gradient = ObservationBuilder.compute_dt_gradient(dt)
 
         return {
             "id": sid,
@@ -489,6 +515,8 @@ class RetinalFundusDataset(Dataset):
             "centerline": torch.from_numpy(cl).unsqueeze(0).float(),
             "fov_mask": torch.from_numpy(fov_f).unsqueeze(0).float(),
             "distance_transform": torch.from_numpy(dt).unsqueeze(0).float(),
+            "vessel_orientation": torch.from_numpy(vessel_orientation).float(),
+            "dt_gradient": torch.from_numpy(dt_gradient).float(),
         }
 
 
@@ -600,7 +628,7 @@ def get_test_data(
     batch_size: int = 1,
     num_workers: int = 0,
     resize: Optional[Tuple[int, int]] = (512, 512),
-    max_samples: Optional[int] = MAX_SAMPLES, 
+    max_samples: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[RetinalFundusDataset, DataLoader]:
     """Load an external test dataset in full (no split).
@@ -626,7 +654,7 @@ def get_test_data(
         target=target,
         split=None,
         resize=resize,
-        max_samples=max_samples, 
+        max_samples=max_samples,
         **kwargs,
     )
     collate_fn = _list_collate if target in ("frangi", "greedy_tracer") else None

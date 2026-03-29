@@ -26,6 +26,10 @@ class FundusPreprocessor:
         self.clahe_tile_size = clahe_tile_size
         self.gamma = gamma
         self.median_kernel = median_kernel
+        self.clahe = cv2.createCLAHE(
+            clipLimit=self.clahe_clip_limit,
+            tileGridSize=(self.clahe_tile_size, self.clahe_tile_size),
+        )
 
     # --------------------------------------------------
     # CHANNEL EXTRACTION
@@ -169,12 +173,8 @@ class FundusPreprocessor:
         # 5. Apply mask BEFORE CLAHE
         gamma_masked = self.apply_mask(denoised, mask)
 
-        # 6. CLAHE (Created on the fly as requested)
-        clahe = cv2.createCLAHE(
-            clipLimit=self.clahe_clip_limit,
-            tileGridSize=(self.clahe_tile_size, self.clahe_tile_size),
-        )
-        clahe_enhanced = clahe.apply(gamma_masked)
+        # 6. CLAHE
+        clahe_enhanced = self.clahe.apply(gamma_masked)
 
         # 7. ROI-Aware Normalize to 0–1
         roi_pixels = clahe_enhanced[mask > 0]

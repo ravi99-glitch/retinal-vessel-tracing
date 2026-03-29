@@ -1,6 +1,5 @@
 # data/centerline_extraction.py
-"""Extract centerlines from binary vessel masks.
-"""
+"""Extract centerlines from binary vessel masks."""
 
 from typing import Dict, List, Optional, Tuple
 
@@ -43,19 +42,18 @@ class CenterlineExtractor:
                     skeleton = self._remove_branch(skeleton, y, x)
         return skeleton
 
-    def _find_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
-        """Find endpoints (pixels with only one neighbor)."""
+    def _get_neighbor_counts(self, skeleton: np.ndarray) -> np.ndarray:
+        """Convolve once; callers threshold the result themselves."""
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
-        neighbor_count = ndimage.convolve(skeleton.astype(int), kernel, mode="constant")
-        endpoints = np.argwhere((skeleton > 0) & (neighbor_count == 1))
-        return [(int(y), int(x)) for y, x in endpoints]
+        return ndimage.convolve(skeleton.astype(np.int32), kernel, mode="constant")
+
+    def _find_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
+        nc = self._get_neighbor_counts(skeleton)
+        return [(int(y), int(x)) for y, x in np.argwhere((skeleton > 0) & (nc == 1))]
 
     def _find_junctions(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
-        """Find junction points (pixels with more than two neighbors)."""
-        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
-        neighbor_count = ndimage.convolve(skeleton.astype(int), kernel, mode="constant")
-        junctions = np.argwhere((skeleton > 0) & (neighbor_count > 2))
-        return [(int(y), int(x)) for y, x in junctions]
+        nc = self._get_neighbor_counts(skeleton)
+        return [(int(y), int(x)) for y, x in np.argwhere((skeleton > 0) & (nc > 2))]
 
     def _trace_branch_length(
         self, skeleton: np.ndarray, start_y: int, start_x: int, max_steps: int = 100
@@ -122,9 +120,13 @@ class CenterlineExtractor:
         """Convert skeleton image to graph representation."""
         G = nx.Graph()
 
-        # Find special points
-        endpoints = self._find_endpoints(skeleton)
-        junctions = self._find_junctions(skeleton)
+        nc = self._get_neighbor_counts(skeleton)
+        endpoints = [
+            (int(y), int(x)) for y, x in np.argwhere((skeleton > 0) & (nc == 1))
+        ]
+        junctions = [
+            (int(y), int(x)) for y, x in np.argwhere((skeleton > 0) & (nc > 2))
+        ]
         special_points = set(endpoints + junctions)
 
         # Add nodes
@@ -175,7 +177,6 @@ class CenterlineExtractor:
         special_points: set,
         max_steps: int = 5000,
     ) -> List[Tuple[int, int]]:
-        """Trace an edge from start through first_step until reaching a special point."""
         path = [start, first_step]
         visited = {start, first_step}
         current = first_step
@@ -184,22 +185,24 @@ class CenterlineExtractor:
             if current in special_points and current != start:
                 return path
 
-            neighbors = self._get_skeleton_neighbors(
-                skeleton, current[0], current[1], np.zeros_like(skeleton, dtype=bool)
-            )
-            neighbors = [n for n in neighbors if n not in visited]
+            neighbors = [
+                (y + dy, x + dx)
+                for dy in (-1, 0, 1)
+                for dx in (-1, 0, 1)
+                if not (dy == 0 and dx == 0)
+                for y, x in (current,)
+                if 0 <= y + dy < skeleton.shape[0]
+                and 0 <= x + dx < skeleton.shape[1]
+                and skeleton[y + dy, x + dx] > 0
+                and (y + dy, x + dx) not in visited
+            ]
 
-            if len(neighbors) == 0:
+            if not neighbors:
                 return path
-            elif len(neighbors) == 1:
-                current = neighbors[0]
-                path.append(current)
-                visited.add(current)
-            else:
-                # Multiple paths - this shouldn't happen on a proper skeleton
-                current = neighbors[0]
-                path.append(current)
-                visited.add(current)
+
+            current = neighbors[0]
+            path.append(current)
+            visited.add(current)
 
         return path
 
