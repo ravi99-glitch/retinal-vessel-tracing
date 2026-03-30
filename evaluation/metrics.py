@@ -150,7 +150,7 @@ class CenterlineMetrics:
         gt_bin = gt > 0
 
         if pred_bin.sum() == 0 and gt_bin.sum() == 0:
-            return 1.0, 1.0, 1.0
+            return 0.0, 0.0, 0.0
         if pred_bin.sum() == 0 or gt_bin.sum() == 0:
             return 0.0, 0.0, 0.0
 
@@ -195,7 +195,7 @@ class CenterlineMetrics:
         gt_bin = gt_mask > 0
 
         if pred_bin.sum() == 0 and gt_bin.sum() == 0:
-            return 1.0
+            return 0.0
         if pred_bin.sum() == 0 or gt_bin.sum() == 0:
             return 0.0
 
@@ -250,7 +250,7 @@ class CenterlineMetrics:
         gt_bin = gt_mask > 0
 
         if pred_bin.sum() == 0 and gt_bin.sum() == 0:
-            return 1.0
+            return 0.0
         if pred_bin.sum() == 0 or gt_bin.sum() == 0:
             return 0.0
 
