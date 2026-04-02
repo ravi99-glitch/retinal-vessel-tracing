@@ -17,13 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-
 # ==========================================
 # GT HEATMAP GENERATION
 # ==========================================
-def create_seed_heatmap(
-    centerline: np.ndarray, sigma: float = 3.0, n_seeds: int = 50
-) -> np.ndarray:
+def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0,
+                        n_seeds: int = 150) -> np.ndarray:
     """Build ground-truth seed heatmap using coverage-based farthest-point sampling.
 
     Instead of placing blobs at every endpoint and junction (which produces
@@ -75,7 +73,6 @@ def create_seed_heatmap(
         heatmap /= heatmap.max()
 
     return heatmap
-
 
 # def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0) -> np.ndarray:
 #     """Build ground-truth seed heatmap for one image.
@@ -237,13 +234,15 @@ class SeedDetectorTrainer:
             SeedDataset(train_samples, sigma=self.sigma),
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=4,
+            pin_memory=True
         )
         val_loader = DataLoader(
             SeedDataset(val_samples, sigma=self.sigma),
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
+            pin_memory=True
         )
 
         print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
