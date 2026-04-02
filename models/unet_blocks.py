@@ -12,26 +12,28 @@ import torch.nn.functional as F
 
 
 class DSConvBlock(nn.Module):
-    """Depthwise-Separable Conv → BN → ReLU (x2)."""
+    """Depthwise-Separable Conv → GroupNorm → ReLU (x2)."""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
+        num_groups = 4 
+        
         self.block = nn.Sequential(
             # first DS conv
             nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),
             nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.GroupNorm(num_groups, out_ch), 
             nn.ReLU(inplace=True),
+            
             # second DS conv
             nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
             nn.Conv2d(out_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.GroupNorm(num_groups, out_ch),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
-
 
 class DownBlock(nn.Module):
     """MaxPool → DSConvBlock."""
