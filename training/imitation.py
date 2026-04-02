@@ -1,31 +1,19 @@
+# training/imitation.py
 """Imitation learning (behaviour cloning)
 
 Provides:
     augment_sample()        — 9 geometric/photometric variants per sample
-    generate_expert_pairs() — walks GT traces → (observation, action) pairs  [FF]
-    generate_expert_sequences() — walks GT traces → episode sequences        [LSTM]
-    ImitationDataset        — PyTorch dataset wrapper (feedforward)
-    ImitationSequenceDataset— PyTorch dataset of variable-length episodes    [LSTM]
-    sequence_collate_fn()   — pads episodes to equal length for batching     [LSTM]
+    generate_expert_pairs() — walks GT traces → (observation, action) pairs
+    ImitationDataset        — PyTorch dataset wrapper
     ImitationTrainer        — train loop, validation, checkpoint saving
-
-Used by:
-    scripts/train_imitation.py  (DRIVE)
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-
-try:
-    import wandb
-
-    _WANDB_AVAILABLE = True
-except ImportError:
-    _WANDB_AVAILABLE = False
 
 # ==========================================
 # ACTION CONSTANTS
@@ -159,39 +147,29 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
 
 
 # ==========================================
-# EXPERT PAIR GENERATION  (feedforward)
+# EXPERT METADATA GENERATION 
 # ==========================================
-
 
 def direction_to_action(dy: int, dx: int) -> int:
     """Convert (dy, dx) step to discrete action index (0–8)."""
     return DIRECTION_MAP.get((dy, dx), 8)
 
-
-def generate_expert_pairs(
-    sample: Dict, config: dict, obs_size: int
-) -> List[Tuple[np.ndarray, int]]:
-    """Walk expert traces and return (observation, action) pairs.
-
-    Each step is independent — used for feedforward (non-LSTM) training.
+def generate_expert_metadata(
+    sample: Dict, sample_idx: int, obs_size: int
+) -> List[Dict]:
+    """Instead of patches, returns metadata for each step to save RAM.
 
     Args:
         sample: dict with image, distance_transform, expert_traces
-        config: full CONFIG dict (for ObservationBuilder)
+        sample_idx: the index of this sample in the full dataset list
         obs_size: observation patch size (e.g. 65)
 
     Returns:
-        List of (obs_array, action_int) tuples
-
+        List of metadata dicts: {sample_idx, pos, action, prev_dir}
     """
-    from environment.observation import ObservationBuilder
-
-    obs_builder = ObservationBuilder(config)
-    image, dt = sample["image"], sample["distance_transform"]
-    h, w = image.shape[:2]
+    h, w = sample["image"].shape[:2]
     half = obs_size // 2
-    visited_mask = np.zeros((h, w), dtype=np.float32)
-    pairs = []
+    steps_meta = []
 
     for trace in sample["expert_traces"]:
         if len(trace) < 2:
@@ -200,11 +178,12 @@ def generate_expert_pairs(
             y, x = trace[i]
             ny, nx = trace[i + 1]
 
+            # Bounds check for the patch
             if y < half or y >= h - half or x < half or x >= w - half:
                 continue
 
             action = direction_to_action(int(ny) - int(y), int(nx) - int(x))
-            if action == 8:
+            if action == 8: # Skip stop/invalid actions
                 continue
 
             prev_dir = (
@@ -215,305 +194,132 @@ def generate_expert_pairs(
                 else None
             )
 
-            obs = obs_builder.build(
-                image=image,
-                visited_mask=visited_mask,
-                vesselness=None,
-                position=np.array([y, x]),
-                prev_direction=prev_dir,
-                distance_transform=dt,
-            )
-            pairs.append((obs, action))
-            visited_mask[y, x] = 1.0
+            steps_meta.append({
+                "sample_idx": sample_idx,
+                "pos": (y, x),
+                "action": action,
+                "prev_dir": prev_dir
+            })
 
-    return pairs
+    return steps_meta
 
 
 # ==========================================
-# EXPERT SEQUENCE GENERATION  (LSTM)
-# ==========================================
-
-
-def generate_expert_sequences(
-    sample: Dict, config: dict, obs_size: int
-) -> List[Dict[str, Any]]:
-    """Walk expert traces and return full episode sequences.
-
-    Unlike generate_expert_pairs(), this preserves temporal ordering
-    and gives each trace its own visited mask (simulating a fresh episode),
-    so the LSTM can learn sequential dependencies.
-
-    Args:
-        sample: dict with image, distance_transform, expert_traces
-        config: full CONFIG dict (for ObservationBuilder)
-        obs_size: observation patch size (e.g. 65)
-
-    Returns:
-        List of sequence dicts, each with:
-            observations : list of np.ndarray (C, H, W)
-            actions      : list of int
-            length       : int
-    """
-    from environment.observation import ObservationBuilder
-
-    obs_builder = ObservationBuilder(config)
-    image, dt = sample["image"], sample["distance_transform"]
-    h, w = image.shape[:2]
-    half = obs_size // 2
-    sequences = []
-
-    for trace in sample["expert_traces"]:
-        if len(trace) < 2:
-            continue
-
-        # Each trace gets its own visited mask (like a fresh episode)
-        visited_mask = np.zeros((h, w), dtype=np.float32)
-        seq_obs: List[np.ndarray] = []
-        seq_actions: List[int] = []
-
-        for i in range(len(trace) - 1):
-            y, x = trace[i]
-            ny, nx = trace[i + 1]
-
-            if y < half or y >= h - half or x < half or x >= w - half:
-                continue
-
-            action = direction_to_action(int(ny) - int(y), int(nx) - int(x))
-            if action == 8:
-                continue
-
-            prev_dir = (
-                direction_to_action(
-                    int(y) - int(trace[i - 1][0]), int(x) - int(trace[i - 1][1])
-                )
-                if i > 0
-                else None
-            )
-
-            obs = obs_builder.build(
-                image=image,
-                visited_mask=visited_mask,
-                vesselness=None,
-                position=np.array([y, x]),
-                prev_direction=prev_dir,
-                distance_transform=dt,
-            )
-            seq_obs.append(obs)
-            seq_actions.append(action)
-            visited_mask[y, x] = 1.0
-
-        if len(seq_obs) >= 2:
-            sequences.append(
-                {
-                    "observations": seq_obs,
-                    "actions": seq_actions,
-                    "length": len(seq_obs),
-                }
-            )
-
-    return sequences
-
-
-# ==========================================
-# DATASETS
+# DATASET 
 # ==========================================
 
 
 class ImitationDataset(Dataset):
-    """PyTorch dataset of (observation, action) pairs — feedforward mode."""
+    """PyTorch dataset that crops patches on-the-fly to save RAM."""
 
-    def __init__(self, pairs: List[Tuple[np.ndarray, int]]):
-        self.obs = [p[0] for p in pairs]
-        self.actions = [p[1] for p in pairs]
+    def __init__(self, samples: List[Dict], metadata: List[Dict], config: dict):
+        """
+        Args:
+            samples: The list of full image dictionaries (571 images)
+            metadata: The list of millions of step instructions
+            config: Full CONFIG dict for the ObservationBuilder
+        """
+        self.samples = samples
+        self.metadata = metadata
+        
+        from environment.observation import ObservationBuilder
+        self.obs_builder = ObservationBuilder(config)
+        
+        # Pre-initialize visited masks to avoid repeated allocation during training
+        self.visited_masks = [
+            np.zeros(s["image"].shape[:2], dtype=np.float32) for s in samples
+        ]
 
     def __len__(self):
-        return len(self.obs)
+        return len(self.metadata)
 
     def __getitem__(self, idx):
-        return (
-            torch.from_numpy(self.obs[idx]).float(),
-            torch.tensor(self.actions[idx], dtype=torch.long),
+        m = self.metadata[idx]
+        s = self.samples[m["sample_idx"]]
+        
+        # Build the 10-channel patch ONLY when the GPU asks for it
+        obs = self.obs_builder.build(
+            image=s["image"],
+            visited_mask=self.visited_masks[m["sample_idx"]],
+            vesselness=None, # Keep as None for imitation learning
+            position=np.array(m["pos"]),
+            prev_direction=m["prev_dir"],
+            distance_transform=s["distance_transform"],
+            
+            # --- NEW ARGUMENTS FOR THE COMPASS ---
+            # During imitation, it is safe to use the GT centerline as the predicted map
+            # because the agent is learning from the expert who also has perfect vision.
+            predicted_vessel_map=(s["centerline"] > 0).astype(np.float32), 
+            vessel_orientation=None, # The builder will auto-compute this if None
+            dt_gradient=None,        # The builder will auto-compute this if None
         )
-
-
-class ImitationSequenceDataset(Dataset):
-    """PyTorch dataset of variable-length episode sequences — LSTM mode.
-
-    Each item is a dict with:
-        observations : torch.Tensor (T, C, H, W)
-        actions      : torch.Tensor (T,)
-        length       : int
-    """
-
-    def __init__(self, sequences: List[Dict[str, Any]]):
-        self.sequences = sequences
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        obs = np.stack(seq["observations"], axis=0)  # (T, C, H, W)
-        actions = np.array(seq["actions"], dtype=np.int64)  # (T,)
-        return {
-            "observations": torch.from_numpy(obs).float(),
-            "actions": torch.from_numpy(actions).long(),
-            "length": seq["length"],
-        }
-
-
-def sequence_collate_fn(
-    batch: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Collate variable-length sequences by padding to max length in batch.
-
-    Returns:
-        observations : (T_max, B, C, H, W)  — time-first for forward_sequence()
-        actions      : (T_max, B)
-        mask         : (T_max, B)  — 1.0 for valid steps, 0.0 for padding
-        dones        : (T_max, B)  — 1.0 at last valid step of each sequence
-        lengths      : list of int
-    """
-    lengths = [item["length"] for item in batch]
-    T_max = max(lengths)
-    B = len(batch)
-    C, H, W = batch[0]["observations"].shape[1:]
-
-    obs_padded = torch.zeros(T_max, B, C, H, W)
-    act_padded = torch.zeros(T_max, B, dtype=torch.long)
-    mask = torch.zeros(T_max, B)
-    dones = torch.zeros(T_max, B)
-
-    for b, item in enumerate(batch):
-        L = item["length"]
-        obs_padded[:L, b] = item["observations"]  # already (T, C, H, W)
-        act_padded[:L, b] = item["actions"]
-        mask[:L, b] = 1.0
-        # Mark last valid step so LSTM resets hidden state for padding region
-        dones[L - 1, b] = 1.0
-
-    return {
-        "observations": obs_padded,
-        "actions": act_padded,
-        "mask": mask,
-        "dones": dones,
-        "lengths": lengths,
-    }
-
-
+        
+        return (
+            torch.from_numpy(obs).float(),
+            torch.tensor(m["action"], dtype=torch.long),
+        )
 # ==========================================
-# TRAINER  (supports both FF and LSTM)
+# TRAINER
 # ==========================================
 
 
 class ImitationTrainer:
-    """Behavior cloning trainer — supports feedforward and LSTM modes.
-
-    Feedforward (use_lstm=False):
-        - Uses ImitationDataset with shuffled (obs, action) pairs
-        - Standard mini-batch cross-entropy
-        - train() signature: train(train_pairs, val_pairs, save_path, config)
-
-    LSTM (use_lstm=True):
-        - Uses ImitationSequenceDataset with full episode sequences
-        - Batches are padded variable-length sequences
-        - Masked cross-entropy loss over valid timesteps
-        - forward_sequence() handles sequential LSTM context
-        - train() signature: train(train_pairs, val_pairs, save_path, config,
-                                   train_sequences=..., val_sequences=...)
+    """Behavior cloning trainer.
 
     Usage:
         trainer = ImitationTrainer(model, device, lr=3e-4, batch_size=128, num_epochs=30)
-        trainer.train(train_pairs, val_pairs, save_path, config,
-                      train_sequences=train_seqs,   # only needed for LSTM
-                      val_sequences=val_seqs)        # only needed for LSTM
+        trainer.train(train_pairs, val_pairs, save_path, config)
     """
 
     def __init__(
         self,
         model: nn.Module,
         device: torch.device,
-        config: dict,
         lr: float = 3e-4,
         batch_size: int = 128,
         num_epochs: int = 30,
-        lstm_batch_size: int = 16,
-        use_wandb: bool = False,
     ):
         self.model = model
-        self.config = config
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
         self.num_epochs = num_epochs
-        self.lstm_batch_size = lstm_batch_size
-        self.use_lstm = getattr(model, "use_lstm", False)
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer,
-            step_size=config.get("training", {}).get("imitation_lr_step_size", 10),
-            gamma=config.get("training", {}).get("imitation_lr_gamma", 0.5),
+            self.optimizer, step_size=10, gamma=0.5
         )
         self.criterion = nn.CrossEntropyLoss()
 
-        self.use_wandb = use_wandb and _WANDB_AVAILABLE
-        if self.use_wandb:
-            wandb.init(
-                project="vessel-tracing-imitation", config=config, resume="allow"
-            )
-
     def train(
         self,
-        train_pairs: List[Tuple],
-        val_pairs: List[Tuple],
+        train_ds: Dataset,
+        val_ds: Dataset,
         save_path: str,
         config: dict,
-        train_sequences: Optional[List[Dict[str, Any]]] = None,
-        val_sequences: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Run the full training loop and save best weights.
 
         Args:
-            train_pairs:     list of (obs, action) for FF training
-            val_pairs:       list of (obs, action) for FF validation
-            save_path:       where to save best checkpoint (.pt)
-            config:          full CONFIG dict (stored in checkpoint)
-            train_sequences: list of sequence dicts for LSTM training (required if use_lstm)
-            val_sequences:   list of sequence dicts for LSTM validation (required if use_lstm)
+            train_pairs: list of (obs, action) for training
+            val_pairs:   list of (obs, action) for validation
+            save_path:   where to save best checkpoint (.pt)
+            config:      full CONFIG dict (stored in checkpoint)
+
         """
-        if self.use_lstm:
-            if train_sequences is None or val_sequences is None:
-                raise ValueError(
-                    "LSTM mode requires train_sequences and val_sequences. "
-                    "Use generate_expert_sequences() to create them."
-                )
-            self._train_lstm(train_sequences, val_sequences, save_path, config)
-        else:
-            self._train_ff(train_pairs, val_pairs, save_path, config)
-
-    # ------------------------------------------------------------------
-    # Feedforward training (original path, unchanged)
-    # ------------------------------------------------------------------
-
-    def _train_ff(
-        self,
-        train_pairs: List[Tuple],
-        val_pairs: List[Tuple],
-        save_path: str,
-        config: dict,
-    ) -> None:
         train_loader = DataLoader(
-            ImitationDataset(train_pairs),
+            train_ds,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=4,
+            pin_memory=True
         )
         val_loader = DataLoader(
-            ImitationDataset(val_pairs),
+            val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
+            pin_memory=True
         )
 
         print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
@@ -521,11 +327,8 @@ class ImitationTrainer:
         best_val_loss = float("inf")
 
         for epoch in range(1, self.num_epochs + 1):
-            train_loss, train_acc, train_gn = self._run_epoch_ff(
-                train_loader, train=True
-            )
-            val_loss, val_acc, _ = self._run_epoch_ff(val_loader, train=False)
-            current_lr = self.scheduler.get_last_lr()[0]
+            train_loss, train_acc = self._run_epoch(train_loader, train=True)
+            val_loss, val_acc = self._run_epoch(val_loader, train=False)
             self.scheduler.step()
 
             print(
@@ -533,19 +336,6 @@ class ImitationTrainer:
                 f"train_loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
             )
-
-            if self.use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": train_loss,
-                        "train/accuracy": train_acc,
-                        "train/grad_norm": train_gn,
-                        "val/loss": val_loss,
-                        "val/accuracy": val_acc,
-                        "train/lr": current_lr,
-                    },
-                    step=epoch,
-                )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -563,16 +353,11 @@ class ImitationTrainer:
                 print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
 
         print(f"\nDone. Best val_loss={best_val_loss:.4f}  →  {save_path}")
-        if self.use_wandb:
-            wandb.finish()
 
-    def _run_epoch_ff(
-        self, loader: DataLoader, train: bool
-    ) -> Tuple[float, float, float]:
-        """Run one feedforward epoch. Returns (loss, accuracy, mean_grad_norm)."""
+    def _run_epoch(self, loader: DataLoader, train: bool) -> Tuple[float, float]:
+        """Run one epoch. Returns (loss, accuracy)."""
         self.model.train() if train else self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
-        total_gn, n_updates = 0.0, 0
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
@@ -586,162 +371,11 @@ class ImitationTrainer:
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
-                    grad_norm = nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.get("training", {}).get(
-                            "imitation_max_grad_norm", 1.0
-                        ),
-                    )
+                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-                    total_gn += grad_norm.item()
-                    n_updates += 1
 
                 total_loss += loss.item() * len(action_batch)
                 correct += (logits.argmax(-1) == action_batch).sum().item()
                 total += len(action_batch)
 
-        return (
-            total_loss / max(total, 1),
-            correct / max(total, 1),
-            total_gn / max(n_updates, 1),
-        )
-
-    # ------------------------------------------------------------------
-    # LSTM sequential training
-    # ------------------------------------------------------------------
-
-    def _train_lstm(
-        self,
-        train_sequences: List[Dict[str, Any]],
-        val_sequences: List[Dict[str, Any]],
-        save_path: str,
-        config: dict,
-    ) -> None:
-        train_loader = DataLoader(
-            ImitationSequenceDataset(train_sequences),
-            batch_size=self.lstm_batch_size,
-            shuffle=True,
-            num_workers=0,
-            collate_fn=sequence_collate_fn,
-        )
-        val_loader = DataLoader(
-            ImitationSequenceDataset(val_sequences),
-            batch_size=self.lstm_batch_size,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=sequence_collate_fn,
-        )
-
-        train_steps = sum(s["length"] for s in train_sequences)
-        val_steps = sum(s["length"] for s in val_sequences)
-        print(
-            f"LSTM imitation: {len(train_sequences)} train seqs ({train_steps} steps)  |  "
-            f"{len(val_sequences)} val seqs ({val_steps} steps)"
-        )
-        print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
-
-        best_val_loss = float("inf")
-
-        for epoch in range(1, self.num_epochs + 1):
-            train_loss, train_acc, train_gn = self._run_epoch_lstm(
-                train_loader, train=True
-            )
-            val_loss, val_acc, _ = self._run_epoch_lstm(val_loader, train=False)
-            current_lr = self.scheduler.get_last_lr()[0]
-            self.scheduler.step()
-
-            print(
-                f"Epoch {epoch:3d}/{self.num_epochs}  "
-                f"train_loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
-                f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
-            )
-
-            if self.use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": train_loss,
-                        "train/accuracy": train_acc,
-                        "train/grad_norm": train_gn,
-                        "val/loss": val_loss,
-                        "val/accuracy": val_acc,
-                        "train/lr": current_lr,
-                    },
-                    step=epoch,
-                )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": self.model.state_dict(),
-                        "optimizer_state_dict": self.optimizer.state_dict(),
-                        "val_loss": val_loss,
-                        "val_acc": val_acc,
-                        "config": config,
-                    },
-                    save_path,
-                )
-                print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
-
-        print(f"\nDone. Best val_loss={best_val_loss:.4f}  →  {save_path}")
-        if self.use_wandb:
-            wandb.finish()
-
-    def _run_epoch_lstm(
-        self, loader: DataLoader, train: bool
-    ) -> Tuple[float, float, float]:
-        """Run one LSTM epoch over padded sequence batches.
-        Returns (loss, accuracy, mean_grad_norm).
-        """
-        self.model.train() if train else self.model.eval()
-        total_loss, correct, total = 0.0, 0, 0
-        total_gn, n_updates = 0.0, 0
-
-        ctx = torch.enable_grad() if train else torch.no_grad()
-        with ctx:
-            for batch in loader:
-                obs_seq = batch["observations"].to(self.device)  # (T, B, C, H, W)
-                actions = batch["actions"].to(self.device)  # (T, B)
-                mask = batch["mask"].to(self.device)  # (T, B)
-                dones = batch["dones"].to(self.device)  # (T, B)
-
-                T, B = obs_seq.shape[:2]
-
-                init_state = self.model.init_hidden(batch_size=B, device=self.device)
-                logits_seq, _ = self.model.forward_sequence(obs_seq, init_state, dones)
-                # logits_seq: (T, B, N_ACTIONS)
-
-                logits_flat = logits_seq.reshape(T * B, -1)
-                actions_flat = actions.reshape(T * B)
-                mask_flat = mask.reshape(T * B)
-
-                per_step_loss = nn.functional.cross_entropy(
-                    logits_flat, actions_flat, reduction="none"
-                )
-                loss = (per_step_loss * mask_flat).sum() / mask_flat.sum().clamp(min=1)
-
-                if train:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    grad_norm = nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.get("training", {}).get(
-                            "imitation_max_grad_norm", 1.0
-                        ),
-                    )
-                    self.optimizer.step()
-                    total_gn += grad_norm.item()
-                    n_updates += 1
-
-                preds = logits_seq.argmax(dim=-1)  # (T, B)
-                valid_steps = mask.sum().item()
-                correct += ((preds == actions) * mask).sum().item()
-                total_loss += loss.item() * valid_steps
-                total += valid_steps
-
-        return (
-            total_loss / max(total, 1),
-            correct / max(total, 1),
-            total_gn / max(n_updates, 1),
-        )
+        return total_loss / total, correct / total
