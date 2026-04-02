@@ -273,13 +273,27 @@ class FrontierTracer:
         path = [start_pos]
         done = False
         alternate_branches = []
+        prev_action = None  # <-- WE NEED THIS
 
         self.model.eval()
         with torch.no_grad():
             while not done:
+                # Use his fast tensor buffer
                 self._obs_buf.copy_(torch.from_numpy(obs))
                 logits, _, _ = self.model(self._obs_buf)
+                
+                # ---------------------------------
+                # 1. Ban the "STOP" action
+                logits[0, 8] = -float("inf")
+                
+                # 2. Ban the "REVERSE" action to prevent 1-pixel oscillation loops
+                if prev_action is not None:
+                    reverse_action = (prev_action + 4) % 8
+                    logits[0, reverse_action] = -float("inf")
+                # ---------------------------------
+
                 action = logits.argmax(dim=-1).item()
+                prev_action = action
 
                 obs, _, terminated, truncated, _ = self.env.step(action)
                 done = terminated or truncated
