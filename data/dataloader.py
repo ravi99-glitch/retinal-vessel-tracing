@@ -10,10 +10,10 @@ External test (used in full, no split):
 
 Supported targets
 -----------------
-unet           – (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
-frangi         – (H,W,3) raw RGB uint8 + binary annotations (numpy)
-greedy_tracer  – (H,W,3) raw RGB uint8 + binary annotations (numpy)
-rl_agent       – (3,H,W) float32 RGB + centerline, distance transform, …
+unet           - (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
+frangi         - (H,W,3) raw RGB uint8 + binary annotations (numpy)
+greedy_tracer  - (H,W,3) raw RGB uint8 + binary annotations (numpy)
+rl_agent       - (3,H,W) float32 RGB + centerline, distance transform, …
 
 Usage
 -----
@@ -38,11 +38,12 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import (ConcatDataset, DataLoader, Dataset,
+                              WeightedRandomSampler)
 
 from .centerline_extraction import CenterlineExtractor
 from .fundus_preprocessor import FundusPreprocessor
-from environment.observation import ObservationBuilder
+from environment.observation import ObservationBuilder  # FIXED typo (observations -> observation)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ _PROJECT_ROOT = _DATA_BASE.parent
 WEIGHTS_DIR = _PROJECT_ROOT / "weights"
 OUTPUT_DIR = _PROJECT_ROOT / "results"
 
-MAX_SAMPLES = 1
+#_PROJECT_ROOT = _DATA_BASE.parent
+#WEIGHTS_DIR = Path("/cfs/earth/scratch/nakanrav/retinal-vessel-tracing/weights")
+#OUTPUT_DIR = Path("/cfs/earth/scratch/nakanrav/retinal-vessel-tracing/results")
 
 
 def get_root(dataset_name: str) -> Path:
@@ -217,7 +220,6 @@ class RetinalFundusDataset(Dataset):
         transform=None,
         fundus_preprocessor: Optional[FundusPreprocessor] = None,
         centerline_extractor: Optional[CenterlineExtractor] = None,
-        max_samples: Optional[int] = None,
     ):
         if target not in VALID_TARGETS:
             raise ValueError(f"target must be one of {VALID_TARGETS}, got '{target}'")
@@ -245,10 +247,6 @@ class RetinalFundusDataset(Dataset):
         if split is not None:
             self.samples = self._apply_split(self.samples, split, train_frac)
 
-        # Cap samples
-        if max_samples is not None and max_samples > 0:
-            self.samples = self.samples[:max_samples]
-
         if not self.samples:
             raise FileNotFoundError(
                 f"No samples found for {canon} in {self.root}. "
@@ -262,8 +260,9 @@ class RetinalFundusDataset(Dataset):
         if cache_centerlines and self.resize is None:
             self._cache_dir = self.root / "centerlines_cache"
             self._cache_dir.mkdir(exist_ok=True)
-
-        self._vo_mem: Dict[str, np.ndarray] = {}
+            
+        # --- NEW: Vessel Orientation Cache ---
+        self._vo_mem: Dict[str, np.ndarray] = {} 
 
         logger.info(
             "%s  %d samples  target=%s  split=%s",
@@ -353,6 +352,7 @@ class RetinalFundusDataset(Dataset):
             np.save(self._cache_dir / f"{sid}_cl.npy", cl)
         return cl
 
+    # --- NEW: Vessel Orientation Method ---
     def _get_vessel_orientation(self, sid: str, image: np.ndarray) -> np.ndarray:
         """Return cached vessel orientation, computing + persisting on first call."""
         if sid in self._vo_mem:
@@ -380,9 +380,7 @@ class RetinalFundusDataset(Dataset):
         return self.fundus_preprocessor.create_fov_mask(green)
 
     # -- Resize ------------------------------------------------------------
-    def _maybe_resize(
-        self, *arrays: np.ndarray, interp: Optional[List[int]] = None
-    ) -> Tuple[np.ndarray, ...]:
+    def _maybe_resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
         if self.resize is None:
             return arrays
         target_h, target_w = self.resize
@@ -413,7 +411,7 @@ class RetinalFundusDataset(Dataset):
             else:
                 padded = np.zeros((target_h, target_w), dtype=arr.dtype)
 
-            padded[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
+            padded[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
             out.append(padded)
 
         return tuple(out)
@@ -475,8 +473,8 @@ class RetinalFundusDataset(Dataset):
         cl = self._get_centerline(sid, vessel)
         return {
             "id": sid,
-            "image": rgb,
-            "preprocessed": preprocessed,
+            "image": rgb,                                      
+            "preprocessed": preprocessed,                     
             "vessel_mask": (vessel * 255).astype(np.uint8),
             "centerline": (cl * 255).astype(np.uint8),
             "fov_mask": fov,
@@ -494,16 +492,14 @@ class RetinalFundusDataset(Dataset):
         img_orig = img_f.copy()
 
         ext_mask = fov if fov.max() > 0 else None
-        enhanced_green = self.fundus_preprocessor.preprocess(
-            rgb, external_mask=ext_mask
-        )
+        enhanced_green = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
         img_f[:, :, 1] = enhanced_green
 
         cl = self._get_centerline(sid, vessel)
         dt = self.cl_extractor.compute_distance_transform(cl, self.tolerance)
         fov_f = (fov > 0).astype(np.float32)
 
-        # Precompute per-image arrays (vessel_orientation is disk-cached)
+        # --- ADDED FOR THE 10-CHANNEL COMPASS ---
         vessel_orientation = self._get_vessel_orientation(sid, img_f)
         dt_gradient = ObservationBuilder.compute_dt_gradient(dt)
 
@@ -531,7 +527,6 @@ def get_data(
     resize: Tuple[int, int] = (512, 512),
     train_frac: float = 0.8,
     balance: bool = True,
-    max_samples_per_dataset: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[ConcatDataset, DataLoader]:
     """Load the combined train/val set (DRIVE + STARE + CHASE_DB1 + HRF + LES_AV).
@@ -578,7 +573,6 @@ def get_data(
                 resize=resize,
                 fundus_preprocessor=shared_pre,
                 centerline_extractor=shared_ext,
-                max_samples=max_samples_per_dataset,
                 **kwargs,
             )
             sub_datasets.append(ds)
@@ -628,7 +622,6 @@ def get_test_data(
     batch_size: int = 1,
     num_workers: int = 0,
     resize: Optional[Tuple[int, int]] = (512, 512),
-    max_samples: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[RetinalFundusDataset, DataLoader]:
     """Load an external test dataset in full (no split).
@@ -654,7 +647,6 @@ def get_test_data(
         target=target,
         split=None,
         resize=resize,
-        max_samples=max_samples,
         **kwargs,
     )
     collate_fn = _list_collate if target in ("frangi", "greedy_tracer") else None
