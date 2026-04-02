@@ -1,4 +1,3 @@
-# observation.py
 """Observation construction for vessel tracing environment."""
 
 from typing import Any, Dict, Optional
@@ -15,16 +14,16 @@ class ObservationBuilder:
     4   : distance transform crop, normalised to [0, 1]
     5   : vessel gradient dy (from DT), normalised to [-1, 1]
     6   : vessel gradient dx (from DT), normalised to [-1, 1]
-    7   : centerline binary mask                                  # NEW
-    8   : vessel tangent dy (along-vessel direction)               # NEW
-    9   : vessel tangent dx (along-vessel direction)               # NEW
+    7   : predicted vessel binary mask (Thresholded at > 0.5)            # THE COMPASS
+    8   : vessel tangent dy (along-vessel direction)                     # THE COMPASS
+    9   : vessel tangent dx (along-vessel direction)                     # THE COMPASS
 
     Total: 10 channels (11 with vesselness)
 
     Channels 5-6 point TOWARD the centerline (perpendicular to vessel).
     Channels 8-9 point ALONG the vessel (tangent direction from structure tensor).
-    Together they give the agent full local geometry: where the centerline is,
-    which way to approach it, and which way the vessel runs.
+    Together they give the agent full local geometry: where the vessel is,
+    which way to approach it, and which way the river flows.
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -34,7 +33,7 @@ class ObservationBuilder:
         self.use_vesselness = env_config.get("use_vesselness", False)
         self.tolerance = env_config.get("tolerance", 2.0)
 
-        # Pre-allocate observation buffer
+        # Pre-allocate observation buffer for extreme speed
         self._max_channels = 11 if self.use_vesselness else 10
         self._obs_buffer = np.zeros(
             (self._max_channels, self.obs_size, self.obs_size), dtype=np.float32
@@ -45,20 +44,23 @@ class ObservationBuilder:
         self,
         distance_transform: np.ndarray,
         dt_gradient: np.ndarray,
-        centerline: np.ndarray,
+        predicted_vessel_map: np.ndarray,  # CHANGED: Prevents GT Data Leakage
         vessel_orientation: np.ndarray,
     ) -> None:
         """Pre-stack static per-episode maps into one (H, W, 6) float32 array.
 
         Call once per episode in set_data(), not per step.
-        Layout: 0=DT  1=grad_y  2=grad_x  3=centerline  4=tangent_y  5=tangent_x
+        Layout: 0=DT  1=grad_y  2=grad_x  3=pred_mask  4=tangent_y  5=tangent_x
         """
         H, W = distance_transform.shape[:2]
         s = np.empty((H, W, 6), dtype=np.float32)
         s[:, :, 0] = distance_transform
         s[:, :, 1] = dt_gradient[:, :, 0]
         s[:, :, 2] = dt_gradient[:, :, 1]
-        s[:, :, 3] = (centerline > 0).astype(np.float32)
+        
+        # CRITICAL FIX: Threshold the probability map at 0.5 to create a binary mask
+        s[:, :, 3] = (predicted_vessel_map > 0.5).astype(np.float32) 
+        
         s[:, :, 4] = vessel_orientation[:, :, 0]
         s[:, :, 5] = vessel_orientation[:, :, 1]
         self._stacked_sources = s
@@ -86,7 +88,7 @@ class ObservationBuilder:
         position: np.ndarray,
         prev_direction: Optional[int],
         distance_transform: Optional[np.ndarray] = None,
-        centerline: Optional[np.ndarray] = None,
+        predicted_vessel_map: Optional[np.ndarray] = None, # CHANGED name
         vessel_orientation: Optional[np.ndarray] = None,
         dt_gradient: Optional[np.ndarray] = None,
     ) -> np.ndarray:
@@ -138,10 +140,13 @@ class ObservationBuilder:
                     mag = np.sqrt(gy**2 + gx**2) + 1e-8
                     buf[5] = gy / mag
                     buf[6] = gx / mag
-            if centerline is not None:
+            
+            # CRITICAL FIX: Ensure thresholding on fallback too
+            if predicted_vessel_map is not None:
                 buf[7] = (
-                    self._crop(centerline, y_start, y_end, x_start, x_end) > 0
+                    self._crop(predicted_vessel_map, y_start, y_end, x_start, x_end) > 0.5
                 ).astype(np.float32)
+                
             if vessel_orientation is not None:
                 orient_crop = self._crop(
                     vessel_orientation, y_start, y_end, x_start, x_end
@@ -211,9 +216,6 @@ class ObservationBuilder:
         j_yy = gaussian_filter(iy * iy, sigma)
 
         # Eigendecomposition: smallest eigenvector = vessel tangent
-        # For 2x2 symmetric matrix, analytic solution:
-        # θ = 0.5 * atan2(2*Jxy, Jxx - Jyy)  gives the dominant orientation
-        # The perpendicular direction (vessel tangent) is θ + π/2
         theta = 0.5 * np.arctan2(2.0 * j_xy, j_xx - j_yy + 1e-10)
 
         # Dominant eigenvector direction (perpendicular to vessel)
