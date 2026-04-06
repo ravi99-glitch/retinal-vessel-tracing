@@ -8,20 +8,19 @@ import numpy as np
 class ObservationBuilder:
     """Builds observation tensors for the RL agent.
 
-    Channels (use_vesselness=False):
+    Channels:
     0-2 : RGB crop
     3   : visited mask crop
     4   : distance transform crop, normalised to [0, 1]
     5   : vessel gradient dy (from DT), normalised to [-1, 1]
     6   : vessel gradient dx (from DT), normalised to [-1, 1]
-    7   : predicted vessel binary mask (Thresholded at > 0.5)            # THE COMPASS
-    8   : vessel tangent dy (along-vessel direction)                     # THE COMPASS
-    9   : vessel tangent dx (along-vessel direction)                     # THE COMPASS
+    7   : vessel tangent dy (along-vessel direction)                     # THE COMPASS
+    8   : vessel tangent dx (along-vessel direction)                     # THE COMPASS
 
-    Total: 10 channels (11 with vesselness)
+    Total: 9 channels
 
     Channels 5-6 point TOWARD the centerline (perpendicular to vessel).
-    Channels 8-9 point ALONG the vessel (tangent direction from structure tensor).
+    Channels 7-8 point ALONG the vessel (tangent direction from structure tensor).
     Together they give the agent full local geometry: where the vessel is,
     which way to approach it, and which way the river flows.
     """
@@ -30,39 +29,33 @@ class ObservationBuilder:
         env_config = config.get("environment", {})
         self.obs_size = env_config.get("observation_size", 65)
         self.half_size = self.obs_size // 2
-        self.use_vesselness = env_config.get("use_vesselness", False)
         self.tolerance = env_config.get("tolerance", 2.0)
 
         # Pre-allocate observation buffer for extreme speed
-        self._max_channels = 11 if self.use_vesselness else 10
+        self._max_channels = 9
         self._obs_buffer = np.zeros(
             (self._max_channels, self.obs_size, self.obs_size), dtype=np.float32
         )
-        self._stacked_sources: Optional[np.ndarray] = None  # (H, W, 6)
+        self._stacked_sources: Optional[np.ndarray] = None  # (H, W, 5)
 
     def prepare_stacked_sources(
         self,
         distance_transform: np.ndarray,
         dt_gradient: np.ndarray,
-        predicted_vessel_map: np.ndarray,  # CHANGED: Prevents GT Data Leakage
         vessel_orientation: np.ndarray,
     ) -> None:
-        """Pre-stack static per-episode maps into one (H, W, 6) float32 array.
+        """Pre-stack static per-episode maps into one (H, W, 5) float32 array.
 
         Call once per episode in set_data(), not per step.
-        Layout: 0=DT  1=grad_y  2=grad_x  3=pred_mask  4=tangent_y  5=tangent_x
+        Layout: 0=DT  1=grad_y  2=grad_x  3=tangent_y  4=tangent_x
         """
         H, W = distance_transform.shape[:2]
-        s = np.empty((H, W, 6), dtype=np.float32)
+        s = np.empty((H, W, 5), dtype=np.float32)
         s[:, :, 0] = distance_transform
         s[:, :, 1] = dt_gradient[:, :, 0]
         s[:, :, 2] = dt_gradient[:, :, 1]
-        
-        # CRITICAL FIX: Threshold the probability map at 0.5 to create a binary mask
-        s[:, :, 3] = (predicted_vessel_map > 0.5).astype(np.float32) 
-        
-        s[:, :, 4] = vessel_orientation[:, :, 0]
-        s[:, :, 5] = vessel_orientation[:, :, 1]
+        s[:, :, 3] = vessel_orientation[:, :, 0]
+        s[:, :, 4] = vessel_orientation[:, :, 1]
         self._stacked_sources = s
 
     @staticmethod
@@ -84,11 +77,9 @@ class ObservationBuilder:
         self,
         image: np.ndarray,
         visited_mask: np.ndarray,
-        vesselness: Optional[np.ndarray],
         position: np.ndarray,
         prev_direction: Optional[int],
         distance_transform: Optional[np.ndarray] = None,
-        predicted_vessel_map: Optional[np.ndarray] = None, # CHANGED name
         vessel_orientation: Optional[np.ndarray] = None,
         dt_gradient: Optional[np.ndarray] = None,
     ) -> np.ndarray:
@@ -99,7 +90,7 @@ class ObservationBuilder:
         x_end = x + self.half_size + 1
 
         buf = self._obs_buffer
-        n = 10
+        n = 9
 
         # --- RGB (channels 0-2) ---
         image_crop = self._crop(image, y_start, y_end, x_start, x_end)
@@ -108,18 +99,18 @@ class ObservationBuilder:
         # --- Visited mask (channel 3) ---
         buf[3] = self._crop(visited_mask, y_start, y_end, x_start, x_end)
 
-        # --- Static channels 4-9 via single crop ---
+        # --- Static channels 4-8 via single crop ---
         if self._stacked_sources is not None:
             static_crop = self._crop(
                 self._stacked_sources, y_start, y_end, x_start, x_end
-            )  # (obs, obs, 6)
-            buf[4:10] = static_crop.transpose(2, 0, 1)
+            )  # (obs, obs, 5)
+            buf[4:9] = static_crop.transpose(2, 0, 1)
             # Normalise DT channel in-place
             buf[4] /= max(self.tolerance, 1e-6)
             np.clip(buf[4], 0.0, 1.0, out=buf[4])
         else:
             # Fallback when prepare_stacked_sources() was not called
-            buf[4:10] = 0
+            buf[4:9] = 0
             if distance_transform is not None:
                 dt_crop = self._crop(
                     distance_transform, y_start, y_end, x_start, x_end
@@ -141,23 +132,12 @@ class ObservationBuilder:
                     buf[5] = gy / mag
                     buf[6] = gx / mag
             
-            # CRITICAL FIX: Ensure thresholding on fallback too
-            if predicted_vessel_map is not None:
-                buf[7] = (
-                    self._crop(predicted_vessel_map, y_start, y_end, x_start, x_end) > 0.5
-                ).astype(np.float32)
-                
             if vessel_orientation is not None:
                 orient_crop = self._crop(
                     vessel_orientation, y_start, y_end, x_start, x_end
                 )
-                buf[8] = orient_crop[:, :, 0]
-                buf[9] = orient_crop[:, :, 1]
-
-        # --- Vesselness (optional) ---
-        if self.use_vesselness and vesselness is not None:
-            buf[n] = self._crop(vesselness, y_start, y_end, x_start, x_end)
-            n += 1
+                buf[7] = orient_crop[:, :, 0]
+                buf[8] = orient_crop[:, :, 1]
 
         # Copy out — buffer is reused across calls
         return buf[:n].copy()
