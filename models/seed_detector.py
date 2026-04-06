@@ -168,7 +168,8 @@ class SeedDetector(nn.Module):
         h: int,
         w: int,
     ) -> List[Tuple[int, int, float]]:
-        """Non-maximum suppression on heatmap → top-k seed list."""
+        """Non-maximum suppression on heatmap → top-k seed list.
+        """
         from skimage.feature import peak_local_max
 
         if not (heatmap > self.confidence_threshold).any():
