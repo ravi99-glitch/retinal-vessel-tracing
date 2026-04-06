@@ -2,10 +2,7 @@
 """Policy network for vessel tracing RL agent.
 
 Actor-Critic with CNN encoder → optional LSTMCell → actor + critic heads.
-
-Two forward modes:
-  forward()          — single timestep, used during rollout collection
-  forward_sequence() — T-step chunk with done masks, used during PPO training
+Updated for 9-channel observation space.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -24,15 +21,14 @@ def _compute_in_channels(config: Dict[str, Any]) -> int:
       distance transform : 1
       vessel grad dy     : 1
       vessel grad dx     : 1
-      centerline mask    : 1    ← NEW
-      vessel tangent dy  : 1    ← NEW
-      vessel tangent dx  : 1    ← NEW
+      vessel tangent dy  : 1
+      vessel tangent dx  : 1
 
-    Total (default): 10
+    Total (default): 9
     """
-    n = 3 + 1 + 1 + 1 + 1 + 1 + 1 + 1  # 10
-    if config.get("environment", {}).get("use_vesselness", False):
-        n += 1
+    # 3 (RGB) + 1 (Visited) + 1 (DT) + 2 (Gradients) + 2 (Tangents) = 9
+    n = 3 + 1 + 1 + 2 + 2 
+
     return n
 
 
