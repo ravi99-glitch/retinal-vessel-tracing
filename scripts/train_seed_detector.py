@@ -1,111 +1,113 @@
-# scripts/train_seed_detector.py
-"""Seed Detector Training — Step 0 (optional but recommended for end-to-end inference).
-
-Trains a UNet-based heatmap predictor to detect vessel endpoints and junctions.
-Architecture: same UNet backbone as centerline_unet_baseline.py (DSConv blocks,
-skip connections, ~0.5M params) with in_channels=3 for RGB input.
-
-Its output replaces the GT-dependent _pick_frontier_seed() at inference time,
-making the pipeline fully end-to-end.
-
-Run BEFORE or independently of train_imitation.py / train_ppo.py.
-
-All logic lives in training/seed_detector_trainer.py.
-This script handles: paths, config, and data loading via the unified dataloader.
+"""
+scripts/train_seed_detector.py
+==============================
+Training script for the sparse keypoint (seeds) detector.
+Targets: Endpoints and Junctions of the retinal vessel tree.
 """
 
 import os
 import sys
-from typing import Dict, List
-
 import torch
+import numpy as np
 
+# Ensure project root is in path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import DEVICE
-from config import SEED_BATCH_SIZE as BATCH_SIZE
-from config import SEED_CONFIG as CONFIG
-from config import SEED_LR as LR
-from config import SEED_NUM_EPOCHS as NUM_EPOCHS
-from config import SEED_SIGMA as SIGMA
-from config import SEED_WEIGHTS_PATH as SAVE_PATH
-from config import TOLERANCE
-from data.centerline_extraction import CenterlineExtractor
-from data.dataloader import get_data
+from data.dataloader import WEIGHTS_DIR, get_data
 from models.seed_detector import SeedDetector
 from training.seed_detector_trainer import SeedDetectorTrainer
 
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SAVE_PATH = str(WEIGHTS_DIR / "seed_detector.pt")
+
+# Training Hyperparameters
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 8       # Adjusted for 32GB RAM / GPU memory
+NUM_EPOCHS = 40      # Heatmap regression takes a bit longer to converge
+SIGMA = 3.0          # Radius of the Gaussian blobs in the GT heatmap
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CONFIG = {
+    "seed_detector": {
+        "base_ch": 16,
+        "nms_radius": 10,
+        "confidence_threshold": 0.3,
+        "top_k_seeds": 400,
+    }
+}
 
 # ==========================================
-# DATA LOADING (unified dataloader)
+# DATA LOADING
 # ==========================================
 
-
-def load_samples(split: str) -> List[Dict]:
-    """Load combined dataset samples for seed detector training."""
-    ds, _ = get_data(
-        "rl_agent",
-        split,
-        tolerance=TOLERANCE,
-    )
-
-    extractor = CenterlineExtractor()
+def dataloader_to_list(dataloader):
+    """
+    Convert torch dataloader batches into a list of dictionaries 
+    for the SeedDetectorTrainer's internal dataset format.
+    """
     samples = []
-
-    for i in range(len(ds)):
-        s = ds[i]
-        sid = s["id"]
-        print(f"  [{s['id']}] image shape: {s['image'].shape}")
-        centerline = s["centerline"].squeeze(0).numpy()
-
-        sample = {
-            "id": sid,
-            "image": s["image"].permute(1, 2, 0).numpy(),  # (3,H,W) → (H,W,3)
-            "centerline": centerline,
-            "fov_mask": s["fov_mask"].squeeze(0).numpy(),
-        }
-        samples.append(sample)
-
-        n_ep = len(extractor._find_endpoints(centerline))
-        n_jn = len(extractor._find_junctions(centerline))
-        print(f"  [{sid}]  endpoints={n_ep}  junctions={n_jn}  seeds={n_ep + n_jn}")
-
-    print(f"Loaded {len(samples)} {split} samples (combined dataset).\n")
+    print("Pre-processing training samples into heatmap-ready format...")
+    
+    for batch in dataloader:
+        # Batch is typically size 1 from the unified get_data call
+        # We extract the components needed for heatmap generation
+        samples.append({
+            "image": batch["image"].squeeze(0).permute(1, 2, 0).numpy(), # (H,W,3), preprocessed image
+            "centerline": batch["centerline"].squeeze(0).squeeze(0).numpy(), # (H,W)
+            "fov_mask": batch["fov_mask"].squeeze(0).squeeze(0).numpy()      # (H,W)
+        })
     return samples
 
-
 # ==========================================
-# MAIN
+# MAIN EXECUTION
 # ==========================================
-
 
 def main():
     print(f"Device: {DEVICE}")
+    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
 
-    train_samples = load_samples("train")
-    val_samples = load_samples("val")
-
-    if not train_samples:
-        print("ERROR: No training samples loaded.")
-        return
-
-    model = SeedDetector(CONFIG).to(DEVICE)
-    trainer = SeedDetectorTrainer(
-        model,
-        DEVICE,
-        lr=LR,
-        batch_size=BATCH_SIZE,
-        num_epochs=NUM_EPOCHS,
-        sigma=SIGMA,
+    # 1. Load Data via Unified Dataloader
+    # Note: Using 'rl_agent' target because it provides raw image + centerline
+    _, train_loader = get_data(
+        target="rl_agent", 
+        split="train", 
+        batch_size=1, 
+        num_workers=4
+    )
+    _, val_loader = get_data(
+        target="rl_agent", 
+        split="val", 
+        batch_size=1, 
+        num_workers=4
     )
 
+    train_samples = dataloader_to_list(train_loader)
+    val_samples = dataloader_to_list(val_loader)
+
+    # 2. Initialize Model and Trainer
+    model = SeedDetector(CONFIG).to(DEVICE)
+    
+    trainer = SeedDetectorTrainer(
+        model=model,
+        device=DEVICE,
+        lr=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
+        sigma=SIGMA
+    )
+
+    # 3. Start Training
+    print("\n--- Starting Seed Detector Training ---")
     trainer.train(
         train_samples=train_samples,
         val_samples=val_samples,
         save_path=SAVE_PATH,
-        config=CONFIG,
+        config=CONFIG
     )
-
+    print(f"\nTraining Complete. Best model saved to: {SAVE_PATH}")
 
 if __name__ == "__main__":
     main()
