@@ -121,7 +121,7 @@ class SeedDataset(Dataset):
     ):
         self.items = []
         for s in samples:
-            gt_hm = create_seed_heatmap(s["centerline"], sigma=sigma)
+            gt_hm = create_seed_heatmap(s["centerline"], sigma=sigma, n_seeds=400)
             img_t = torch.from_numpy(s["image"].transpose(2, 0, 1)).float()
             hm_t = torch.from_numpy(gt_hm).unsqueeze(0).float()
             fov_t = torch.from_numpy(s["fov_mask"]).unsqueeze(0).float()
