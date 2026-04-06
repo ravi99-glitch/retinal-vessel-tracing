@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+import math
 
 import gymnasium as gym
 import numpy as np
@@ -19,7 +20,6 @@ class EnvConfig:
     tolerance: float = 2.0
     max_off_track_streak: int = 5
     max_steps_per_episode: int = 2000
-    use_vesselness: bool = False
 
 class VesselTracingEnv(gym.Env):
     """RL Environment for tracing vessel centerlines."""
@@ -35,7 +35,6 @@ class VesselTracingEnv(gym.Env):
         image: Optional[np.ndarray] = None,
         centerline: Optional[np.ndarray] = None,
         distance_transform: Optional[np.ndarray] = None,
-        vesselness: Optional[np.ndarray] = None,
         fov_mask: Optional[np.ndarray] = None,
     ):
         super().__init__()
@@ -51,7 +50,6 @@ class VesselTracingEnv(gym.Env):
         self.image = image
         self.centerline = centerline
         self.distance_transform = distance_transform
-        self.vesselness = vesselness
         self.fov_mask = fov_mask
 
         self.vessel_orientation = None
@@ -78,11 +76,7 @@ class VesselTracingEnv(gym.Env):
         self.covered_centerline = None
 
     def _setup_observation_space(self):
-        use_vesselness = self.config.get("environment", {}).get("use_vesselness", False)
-        n_channels = 10  # UPDATED: Now requires 10 base channels
-        if use_vesselness:
-            n_channels += 1
-
+        n_channels = 9
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, 
             shape=(n_channels, self.obs_size, self.obs_size),
@@ -94,7 +88,6 @@ class VesselTracingEnv(gym.Env):
         image: np.ndarray,
         centerline: np.ndarray,
         distance_transform: np.ndarray,
-        vesselness: Optional[np.ndarray] = None,
         fov_mask: Optional[np.ndarray] = None,
         vessel_orientation: Optional[np.ndarray] = None,
         dt_gradient: Optional[np.ndarray] = None,
@@ -102,7 +95,6 @@ class VesselTracingEnv(gym.Env):
         self.image = image
         self.centerline = centerline
         self.distance_transform = distance_transform
-        self.vesselness = vesselness
         self.fov_mask = fov_mask if fov_mask is not None else np.ones_like(centerline)
         self.height, self.width = image.shape[:2]
 
@@ -116,11 +108,9 @@ class VesselTracingEnv(gym.Env):
             else self.observation_builder.compute_dt_gradient(distance_transform)
         )
 
-        # --- PRE-ALLOCATE THE BUFFER (No Data Leakage!) ---
         self.observation_builder.prepare_stacked_sources(
             distance_transform=distance_transform,
             dt_gradient=self.dt_gradient,
-            predicted_vessel_map=vesselness if vesselness is not None else np.zeros_like(centerline),
             vessel_orientation=self.vessel_orientation,
         )
 
@@ -188,8 +178,14 @@ class VesselTracingEnv(gym.Env):
         old_position = self.position.copy()
         self.position = new_position
 
-        is_revisit = self.visited_mask[self.position[0], self.position[1]] > 0
-        self.visited_mask[self.position[0], self.position[1]] = 1.0
+        y, x = self.position
+        is_revisit = self.visited_mask[y, x] > 0
+        
+        # Draw a 3x3 square on the visited mask to repel parallel tracking
+        y_min, y_max = max(0, y - 1), min(self.height, y + 2)
+        x_min, x_max = max(0, x - 1), min(self.width, x + 2)
+        self.visited_mask[y_min:y_max, x_min:x_max] = 1.0
+        
         self.trajectory.append(tuple(self.position))
 
         distance = self.distance_transform[self.position[0], self.position[1]]
@@ -202,7 +198,17 @@ class VesselTracingEnv(gym.Env):
 
         prev_coverage = self.covered_centerline.sum()
         self._update_coverage()
-        new_coverage = self.covered_centerline.sum() - prev_coverage
+        new_coverage = float(self.covered_centerline.sum() - prev_coverage)
+
+        # =================================================================
+        # CONTINUOUS BULLSEYE REWARD
+        # Reward exploration based on how perfectly centered the agent is
+        # =================================================================
+        if distance <= 4.0 and new_coverage > 0:
+            # Gaussian drop-off formula: e^(-(x^2) / sigma^2)
+            bullseye_multiplier = math.exp(-(distance ** 2) / 2.0)
+            new_coverage = new_coverage * bullseye_multiplier
+        # =================================================================
 
         reward = self.reward_calculator.compute_step_reward(
             distance=distance,
@@ -251,13 +257,11 @@ class VesselTracingEnv(gym.Env):
         return self.observation_builder.build(
             image=self.image,
             visited_mask=self.visited_mask,
-            vesselness=self.vesselness,
             position=self.position,
             prev_direction=self.prev_direction,
             distance_transform=self.distance_transform,
-            predicted_vessel_map=self.vesselness,       # UPDATED
-            vessel_orientation=self.vessel_orientation, # UPDATED
-            dt_gradient=self.dt_gradient,               # UPDATED
+            vessel_orientation=self.vessel_orientation,
+            dt_gradient=self.dt_gradient,               
         )
 
     def _get_info(self) -> Dict[str, Any]:
@@ -309,7 +313,6 @@ class VectorizedVesselEnv:
                 centerline=sample["centerline"].squeeze().numpy(),
                 distance_transform=sample["distance_transform"].squeeze().numpy(),
                 fov_mask=sample["fov_mask"].squeeze().numpy(),
-                vesselness=sample.get("unet_prob_map", None), # UPDATED
                 vessel_orientation=(sample["vessel_orientation"].numpy() if "vessel_orientation" in sample else None),
                 dt_gradient=(sample["dt_gradient"].numpy() if "dt_gradient" in sample else None),
             )
@@ -330,7 +333,6 @@ class VectorizedVesselEnv:
                     centerline=sample["centerline"].squeeze().numpy(),
                     distance_transform=sample["distance_transform"].squeeze().numpy(),
                     fov_mask=sample["fov_mask"].squeeze().numpy(),
-                    vesselness=sample.get("unet_prob_map", None), # UPDATED
                     vessel_orientation=(sample["vessel_orientation"].numpy() if "vessel_orientation" in sample else None),
                     dt_gradient=(sample["dt_gradient"].numpy() if "dt_gradient" in sample else None),
                 )
