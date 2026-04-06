@@ -67,12 +67,20 @@ def augment_sample(sample: Dict, tolerance: float) -> List[Dict]:
     def make(new_img, new_cl, new_fov, new_traces):
         ext = CenterlineExtractor(min_branch_length=10, prune_iterations=5)
         new_dt = ext.compute_distance_transform(new_cl, tolerance=tolerance)
+        # Precompute orientation/gradient for the augmented version
+        from environment.observation import ObservationBuilder
+        new_orient = ObservationBuilder.compute_vessel_orientation(new_img)
+        new_grad = ObservationBuilder.compute_dt_gradient(new_dt)
+        
         return {
             "image": new_img,
             "centerline": new_cl,
             "distance_transform": new_dt,
             "fov_mask": new_fov,
-            "expert_traces": new_traces,
+            "expert_traces": new_traces, # Keep this for metadata gen
+            "vessel_mask": (new_cl > 0).astype(np.uint8),
+            "vessel_orientation": new_orient,
+            "dt_gradient": new_grad,
         }
 
     aug = []
@@ -155,18 +163,14 @@ def direction_to_action(dy: int, dx: int) -> int:
     return DIRECTION_MAP.get((dy, dx), 8)
 
 def generate_expert_metadata(
-    sample: Dict, sample_idx: int, obs_size: int
+    sample: Dict, sample_idx: int, obs_size: int, jitter_prob: float = 0.5
 ) -> List[Dict]:
     """Instead of patches, returns metadata for each step to save RAM.
-
-    Args:
-        sample: dict with image, distance_transform, expert_traces
-        sample_idx: the index of this sample in the full dataset list
-        obs_size: observation patch size (e.g. 65)
-
-    Returns:
-        List of metadata dicts: {sample_idx, pos, action, prev_dir}
+    Includes Recovery Jitter to teach the agent how to return to the centerline.
     """
+    import random
+    import numpy as np
+
     h, w = sample["image"].shape[:2]
     half = obs_size // 2
     steps_meta = []
@@ -194,6 +198,9 @@ def generate_expert_metadata(
                 else None
             )
 
+            # --------------------------------------------------
+            # 1. The Perfect Step (On the Centerline)
+            # --------------------------------------------------
             steps_meta.append({
                 "sample_idx": sample_idx,
                 "pos": (y, x),
@@ -201,13 +208,38 @@ def generate_expert_metadata(
                 "prev_dir": prev_dir
             })
 
+            # --------------------------------------------------
+            # 2. RECOVERY JITTER (DAgger-lite)
+            # --------------------------------------------------
+            # 50% chance to simulate a mistake (stepping 1-2 pixels off track)
+            if random.random() < jitter_prob:
+                j_dy = random.choice([-2, -1, 1, 2])
+                j_dx = random.choice([-2, -1, 1, 2])
+                jy, jx = y + j_dy, x + j_dx
+
+                # Bounds check for the jittered position
+                if half <= jy < h - half and half <= jx < w - half:
+                    
+                    # Calculate vector from the jittered mistake to the NEXT valid pixel
+                    rec_dy = np.sign(ny - jy)
+                    rec_dx = np.sign(nx - jx)
+                    
+                    recover_action = direction_to_action(int(rec_dy), int(rec_dx))
+                    
+                    if recover_action != 8:
+                        steps_meta.append({
+                            "sample_idx": sample_idx,
+                            "pos": (jy, jx),
+                            "action": recover_action,
+                            "prev_dir": prev_dir # Keep the same momentum context
+                        })
+
     return steps_meta
 
 
 # ==========================================
 # DATASET 
 # ==========================================
-
 
 class ImitationDataset(Dataset):
     """PyTorch dataset that crops patches on-the-fly to save RAM."""
@@ -237,21 +269,18 @@ class ImitationDataset(Dataset):
         m = self.metadata[idx]
         s = self.samples[m["sample_idx"]]
         
-        # Build the 10-channel patch ONLY when the GPU asks for it
         obs = self.obs_builder.build(
             image=s["image"],
             visited_mask=self.visited_masks[m["sample_idx"]],
-            vesselness=None, # Keep as None for imitation learning
             position=np.array(m["pos"]),
             prev_direction=m["prev_dir"],
             distance_transform=s["distance_transform"],
             
-            # --- NEW ARGUMENTS FOR THE COMPASS ---
+            # --- COMPASS ---
             # During imitation, it is safe to use the GT centerline as the predicted map
             # because the agent is learning from the expert who also has perfect vision.
-            predicted_vessel_map=(s["centerline"] > 0).astype(np.float32), 
-            vessel_orientation=None, # The builder will auto-compute this if None
-            dt_gradient=None,        # The builder will auto-compute this if None
+            vessel_orientation=s["vessel_orientation"], # The builder will auto-compute this if None
+            dt_gradient=s["dt_gradient"],        # The builder will auto-compute this if None
         )
         
         return (
@@ -261,7 +290,6 @@ class ImitationDataset(Dataset):
 # ==========================================
 # TRAINER
 # ==========================================
-
 
 class ImitationTrainer:
     """Behavior cloning trainer.
