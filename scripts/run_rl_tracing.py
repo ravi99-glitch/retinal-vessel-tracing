@@ -42,15 +42,15 @@ SEED_WEIGHTS = str(WEIGHTS_DIR / "seed_detector.pt")
 
 TOLERANCE = 2.0
 OBS_SIZE = 65
-MAX_STEPS = 1000
-MAX_TRACES = 50
+MAX_STEPS = 2000
+
+MAX_TRACES = 50 
 MIN_PATH_LENGTH = 15
 MIN_COV_GAIN = 0.001
 
 # FOV-ring peripheral seeding params
 N_RING_SEEDS = 0
 RING_INSET_PX = 40
-
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -253,7 +253,6 @@ def trace_gt_mode(ppo_model, sample):
 def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
     mask_coverage = sample["fov_mask"].mean()
     if mask_coverage < 0.25:
-        tqdm.write("    WARNING: FOV mask is broken! Fixing globally...")
         sample["fov_mask"] = (np.ones_like(sample["fov_mask"])).astype(np.uint8)
         no_fov = True 
 
@@ -290,8 +289,6 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
     merged = valid_merged
     # ---------------------------------------------
 
-    tqdm.write(f"    Detector seeds: {len(seeds)} | Total valid merged seeds: {len(merged)}")
-
     env = VesselTracingEnv(PPO_CONFIG)
     tracer = FrontierTracer(env, ppo_model, DEVICE, obs_size=OBS_SIZE)
     combined, paths = tracer.trace_from_seeds(sample, merged)
@@ -305,6 +302,69 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
             filtered_combined[y, x] = 1.0
 
     return filtered_combined, filtered_paths, merged
+
+# ==========================================
+# TEST-TIME AUGMENTATION (TTA) WRAPPER
+# ==========================================
+def trace_e2e_tta(ppo_model, seed_model, sample, no_fov=False):
+    """Runs the agent 3 times (Normal, H-Flip, V-Flip) and takes a majority vote."""
+    h, w = sample["image"].shape[:2]
+
+    def create_flipped_sample(s, flip_code):
+        """flip_code: 1 = Horizontal, 0 = Vertical"""
+        s_out = s.copy()
+        
+        if flip_code == 1:  # Horizontal
+            s_out["image"] = s["image"][:, ::-1, :].copy()
+            s_out["fov_mask"] = s["fov_mask"][:, ::-1].copy()
+            s_out["vessel_mask"] = s["vessel_mask"][:, ::-1].copy()
+            s_out["distance_transform"] = s["distance_transform"][:, ::-1].copy()
+            s_out["centerline"] = s["centerline"][:, ::-1].copy()
+        elif flip_code == 0:  # Vertical
+            s_out["image"] = s["image"][::-1, :, :].copy()
+            s_out["fov_mask"] = s["fov_mask"][::-1, :].copy()
+            s_out["vessel_mask"] = s["vessel_mask"][::-1, :].copy()
+            s_out["distance_transform"] = s["distance_transform"][::-1, :].copy()
+            s_out["centerline"] = s["centerline"][::-1, :].copy()
+            
+        # Delete vectors so the environment automatically recomputes them for the flipped image!
+        s_out.pop("vessel_orientation", None)
+        s_out.pop("dt_gradient", None)
+        return s_out
+
+    # --- 1. Normal Run ---
+    tqdm.write("      → [TTA 1/3] Standard orientation...")
+    mask1, paths1, seeds1 = trace_e2e_mode(ppo_model, seed_model, sample, no_fov)
+
+    # --- 2. Horizontal Flip Run ---
+    tqdm.write("      → [TTA 2/3] Horizontal flip...")
+    sample_h = create_flipped_sample(sample, 1)
+    mask_h, paths_h, seeds_h = trace_e2e_mode(ppo_model, seed_model, sample_h, no_fov)
+    
+    # Flip the results back
+    mask2 = mask_h[:, ::-1].copy()
+    paths2 = [[(y, w - 1 - x) for y, x in p] for p in paths_h]
+    seeds2 = [(y, w - 1 - x) for y, x in seeds_h]
+
+    # --- 3. Vertical Flip Run ---
+    tqdm.write("      → [TTA 3/3] Vertical flip...")
+    sample_v = create_flipped_sample(sample, 0)
+    mask_v, paths_v, seeds_v = trace_e2e_mode(ppo_model, seed_model, sample_v, no_fov)
+    
+    # Flip the results back
+    mask3 = mask_v[::-1, :].copy()
+    paths3 = [[(h - 1 - y, x) for y, x in p] for p in paths_v]
+    seeds3 = [(h - 1 - y, x) for y, x in seeds_v]
+
+    # --- MAJORITY VOTE ---
+    # A pixel is kept if >= 2 models agree it's a vessel
+    final_mask = ((mask1 + mask2 + mask3) >= 2.0).astype(np.float32)
+    
+    # Combine paths and seeds for the visualization overlay
+    final_paths = paths1 + paths2 + paths3
+    final_seeds = seeds1 + seeds2 + seeds3
+
+    return final_mask, final_paths, final_seeds
 
 def make_overlay(image_orig, gt_centerline, traced, paths, all_seeds=None):
     gray = cv2.cvtColor((image_orig * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -327,7 +387,7 @@ def make_overlay(image_orig, gt_centerline, traced, paths, all_seeds=None):
 
 def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
     img_id = sample["id"]
-    tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE}]")
+    tqdm.write(f"\nProcessing Image {img_id} [Mode: {MODE} w/ TTA]")
     
     inv_mask = (sample["vessel_mask"] == 0).astype(np.uint8)
     pixel_dt = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 3)
@@ -340,7 +400,8 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
         traced, paths = trace_gt_mode(ppo_model, sample)
         all_seeds = [] 
     else:
-        traced, paths, all_seeds = trace_e2e_mode(ppo_model, seed_model, sample, no_fov=no_fov)
+        # Use the new TTA Wrapper!
+        traced, paths, all_seeds = trace_e2e_tta(ppo_model, seed_model, sample, no_fov=no_fov)
 
     traced, paths = smooth_paths_and_redraw(paths, sample["image"].shape[:2], window=7)
 
@@ -392,7 +453,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
     axes[1].axis("off")
 
     axes[2].imshow(traced, cmap="gray")
-    axes[2].set_title(f"(c) Agent Traced ({n_traces_used} paths)", fontsize=10)
+    axes[2].set_title(f"(c) Agent Traced TTA ({n_traces_used} paths)", fontsize=10)
     axes[2].axis("off")
 
     axes[3].imshow(overlay)
