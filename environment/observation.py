@@ -145,28 +145,34 @@ class ObservationBuilder:
     def _crop(
         self, array: np.ndarray, y_start: int, y_end: int, x_start: int, x_end: int
     ) -> np.ndarray:
-        """Extract a crop with zero-padding at boundaries."""
+        """Extract a crop using fast pre-allocation"""
         h, w = array.shape[:2]
-
-        pad_top = max(0, -y_start)
-        pad_bottom = max(0, y_end - h)
-        pad_left = max(0, -x_start)
-        pad_right = max(0, x_end - w)
 
         ys = max(0, y_start)
         ye = min(h, y_end)
         xs = max(0, x_start)
         xe = min(w, x_end)
 
-        crop = array[ys:ye, xs:xe]
+        # The valid region from the source array
+        valid_crop = array[ys:ye, xs:xe]
 
-        if pad_top or pad_bottom or pad_left or pad_right:
-            pw = ((pad_top, pad_bottom), (pad_left, pad_right))
-            if array.ndim == 3:
-                pw = pw + ((0, 0),)
-            crop = np.pad(crop, pw, mode="constant", constant_values=0)
+        # Fast path: If the crop is fully inside the image, return it immediately
+        if y_start >= 0 and y_end <= h and x_start >= 0 and x_end <= w:
+            return valid_crop
 
-        return crop
+        # Padding path: Pre-allocate a blank array of the target size (much faster than np.pad)
+        target_shape = list(valid_crop.shape)
+        target_shape[0] = y_end - y_start
+        target_shape[1] = x_end - x_start
+        
+        padded = np.zeros(target_shape, dtype=array.dtype)
+        
+        # Calculate where to drop the valid crop into the padded array
+        put_y = ys - y_start
+        put_x = xs - x_start
+        padded[put_y:put_y + (ye - ys), put_x:put_x + (xe - xs)] = valid_crop
+
+        return padded
 
     @staticmethod
     def compute_vessel_orientation(image: np.ndarray) -> np.ndarray:
