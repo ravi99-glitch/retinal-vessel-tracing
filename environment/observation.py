@@ -1,213 +1,367 @@
-"""Observation construction for vessel tracing environment."""
+# environment/vessel_env.py
+"""RL Environment for vessel tracing."""
 
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+import math
 
+import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
 
+from .observation import ObservationBuilder
+from .reward import RewardCalculator
 
-class ObservationBuilder:
-    """Builds observation tensors for the RL agent.
+@dataclass
+class EnvConfig:
+    """Environment configuration."""
+    observation_size: int = 65
+    step_size: int = 1
+    tolerance: float = 2.0
+    max_off_track_streak: int = 5
+    max_steps_per_episode: int = 2000
 
-    Channels:
-    0-2 : RGB crop
-    3   : visited mask crop
-    4   : distance transform crop, normalised to [0, 1]
-    5   : vessel gradient dy (from DT), normalised to [-1, 1]
-    6   : vessel gradient dx (from DT), normalised to [-1, 1]
-    7   : vessel tangent dy (along-vessel direction)                     # THE COMPASS
-    8   : vessel tangent dx (along-vessel direction)                     # THE COMPASS
+class VesselTracingEnv(gym.Env):
+    """RL Environment for tracing vessel centerlines."""
 
-    Total: 9 channels
+    DIRECTIONS = np.array([
+        [-1, 0], [-1, 1], [0, 1], [1, 1], 
+        [1, 0], [1, -1], [0, -1], [-1, -1]
+    ])
 
-    Channels 5-6 point TOWARD the centerline (perpendicular to vessel).
-    Channels 7-8 point ALONG the vessel (tangent direction from structure tensor).
-    Together they give the agent full local geometry: where the vessel is,
-    which way to approach it, and which way the river flows.
-    """
-
-    def __init__(self, config: Dict[str, Any]):
-        env_config = config.get("environment", {})
-        self.obs_size = env_config.get("observation_size", 65)
-        self.half_size = self.obs_size // 2
-        self.tolerance = env_config.get("tolerance", 2.0)
-
-        # Pre-allocate observation buffer for extreme speed
-        self._max_channels = 9
-        self._obs_buffer = np.zeros(
-            (self._max_channels, self.obs_size, self.obs_size), dtype=np.float32
-        )
-        self._stacked_sources: Optional[np.ndarray] = None  # (H, W, 5)
-
-    def prepare_stacked_sources(
+    def __init__(
         self,
-        distance_transform: np.ndarray,
-        dt_gradient: np.ndarray,
-        vessel_orientation: np.ndarray,
-    ) -> None:
-        """Pre-stack static per-episode maps into one (H, W, 5) float32 array.
+        config: Dict[str, Any],
+        image: Optional[np.ndarray] = None,
+        centerline: Optional[np.ndarray] = None,
+        distance_transform: Optional[np.ndarray] = None,
+        fov_mask: Optional[np.ndarray] = None,
+    ):
+        super().__init__()
+        self.config = config
+        env_config = config.get("environment", {})
 
-        Call once per episode in set_data(), not per step.
-        Layout: 0=DT  1=grad_y  2=grad_x  3=tangent_y  4=tangent_x
-        """
-        H, W = distance_transform.shape[:2]
-        s = np.empty((H, W, 5), dtype=np.float32)
-        s[:, :, 0] = distance_transform
-        s[:, :, 1] = dt_gradient[:, :, 0]
-        s[:, :, 2] = dt_gradient[:, :, 1]
-        s[:, :, 3] = vessel_orientation[:, :, 0]
-        s[:, :, 4] = vessel_orientation[:, :, 1]
-        self._stacked_sources = s
+        self.obs_size = env_config.get("observation_size", 65)
+        self.step_size = env_config.get("step_size", 1)
+        self.tolerance = env_config.get("tolerance", 2.0)
+        self.max_off_track = env_config.get("max_off_track_streak", 3)
+        self.max_steps = env_config.get("max_steps_per_episode", 2000)
 
-    @staticmethod
-    def compute_dt_gradient(distance_transform: np.ndarray) -> np.ndarray:
-        """Precompute full-image DT gradient. Call once per episode in set_data().
+        self.image = image
+        self.centerline = centerline
+        self.distance_transform = distance_transform
+        self.fov_mask = fov_mask
 
-        Returns (H, W, 2) array of [grad_y, grad_x], negated and normalised
-        so vectors point TOWARD the centerline.
-        """
-        dt = distance_transform.astype(np.float32)
-        grad_y, grad_x = np.gradient(dt)
-        grad_y, grad_x = -grad_y, -grad_x  # point toward centerline
-        mag = np.sqrt(grad_y**2 + grad_x**2) + 1e-8
-        grad_y = (grad_y / mag).astype(np.float32)
-        grad_x = (grad_x / mag).astype(np.float32)
-        return np.stack([grad_y, grad_x], axis=-1)  # (H, W, 2)
+        self.vessel_orientation = None
+        self.dt_gradient = None
 
-    def build(
+        if image is not None:
+            self.height, self.width = image.shape[:2]
+        else:
+            self.height, self.width = 512, 512
+
+        self.action_space = spaces.Discrete(9)
+        self._setup_observation_space()
+
+        self.reward_calculator = RewardCalculator(config)
+        self.observation_builder = ObservationBuilder(config)
+
+        # Episode state
+        self.position = None
+        self.visited_mask = None
+        self.trajectory = None
+        self.step_count = 0
+        self.off_track_streak = 0
+        self.prev_direction = None
+        self.covered_centerline = None
+
+    def _setup_observation_space(self):
+        n_channels = 9
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, 
+            shape=(n_channels, self.obs_size, self.obs_size),
+            dtype=np.float32,
+        )
+
+    def set_data(
         self,
         image: np.ndarray,
-        visited_mask: np.ndarray,
-        position: np.ndarray,
-        prev_direction: Optional[int],
-        distance_transform: Optional[np.ndarray] = None,
+        centerline: np.ndarray,
+        distance_transform: np.ndarray,
+        fov_mask: Optional[np.ndarray] = None,
         vessel_orientation: Optional[np.ndarray] = None,
         dt_gradient: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        y, x = int(position[0]), int(position[1])
-        y_start = y - self.half_size
-        y_end = y + self.half_size + 1
-        x_start = x - self.half_size
-        x_end = x + self.half_size + 1
+    ):
+        self.image = image
+        self.centerline = centerline
+        self.distance_transform = distance_transform
+        self.fov_mask = fov_mask if fov_mask is not None else np.ones_like(centerline)
+        self.height, self.width = image.shape[:2]
 
-        buf = self._obs_buffer
-        n = 9
+        # --- PRECOMPUTE THE COMPASS TANGENTS ---
+        self.vessel_orientation = (
+            vessel_orientation if vessel_orientation is not None
+            else self.observation_builder.compute_vessel_orientation(image)
+        )
+        self.dt_gradient = (
+            dt_gradient if dt_gradient is not None
+            else self.observation_builder.compute_dt_gradient(distance_transform)
+        )
 
-        # --- RGB (channels 0-2) ---
-        image_crop = self._crop(image, y_start, y_end, x_start, x_end)
-        buf[0:3] = image_crop.transpose(2, 0, 1)
+        self.observation_builder.prepare_stacked_sources(
+            distance_transform=distance_transform,
+            dt_gradient=self.dt_gradient,
+            vessel_orientation=self.vessel_orientation,
+        )
 
-        # --- Visited mask (channel 3) ---
-        buf[3] = self._crop(visited_mask, y_start, y_end, x_start, x_end)
+    def reset(
+        self, seed: Optional[int] = None, start_position: Optional[Tuple[int, int]] = None, **kwargs
+    ) -> Tuple[np.ndarray, Dict]:
+        super().reset(seed=seed)
+        if self.image is None:
+            raise ValueError("No image data set. Call set_data() first.")
 
-        # --- Static channels 4-8 via single crop ---
-        if self._stacked_sources is not None:
-            static_crop = self._crop(
-                self._stacked_sources, y_start, y_end, x_start, x_end
-            )  # (obs, obs, 5)
-            buf[4:9] = static_crop.transpose(2, 0, 1)
-            # Normalise DT channel in-place
-            buf[4] /= max(self.tolerance, 1e-6)
-            np.clip(buf[4], 0.0, 1.0, out=buf[4])
+        self.visited_mask = np.zeros((self.height, self.width), dtype=np.float32)
+        self.trajectory = []
+        self.step_count = 0
+        self.off_track_streak = 0
+        self.prev_direction = None
+        self.covered_centerline = np.zeros_like(self.centerline, dtype=np.float32)
+
+        if start_position is not None:
+            self.position = np.array(start_position, dtype=np.int32)
         else:
-            # Fallback when prepare_stacked_sources() was not called
-            buf[4:9] = 0
-            if distance_transform is not None:
-                dt_crop = self._crop(
-                    distance_transform, y_start, y_end, x_start, x_end
-                ).astype(np.float32)
-                dt_crop /= max(self.tolerance, 1e-6)
-                np.clip(dt_crop, 0.0, 1.0, out=dt_crop)
-                buf[4] = dt_crop
-                if dt_gradient is not None:
-                    grad_crop = self._crop(dt_gradient, y_start, y_end, x_start, x_end)
-                    buf[5] = grad_crop[:, :, 0]
-                    buf[6] = grad_crop[:, :, 1]
-                else:
-                    raw_dt = self._crop(
-                        distance_transform, y_start, y_end, x_start, x_end
-                    ).astype(np.float32)
-                    gy, gx = np.gradient(raw_dt)
-                    gy, gx = -gy, -gx
-                    mag = np.sqrt(gy**2 + gx**2) + 1e-8
-                    buf[5] = gy / mag
-                    buf[6] = gx / mag
-            
-            if vessel_orientation is not None:
-                orient_crop = self._crop(
-                    vessel_orientation, y_start, y_end, x_start, x_end
+            self.position = self._sample_start_position()
+
+        self.visited_mask[self.position[0], self.position[1]] = 1.0
+        self.trajectory.append(tuple(self.position))
+        self._update_coverage()
+
+        return self._get_observation(), self._get_info()
+
+    def _sample_start_position(self) -> np.ndarray:
+        centerline_points = np.argwhere(self.centerline > 0)
+        if len(centerline_points) == 0:
+            fov_points = np.argwhere(self.fov_mask > 0)
+            if len(fov_points) == 0:
+                return np.array([self.height // 2, self.width // 2])
+            idx = self.np_random.integers(len(fov_points))
+            return fov_points[idx]
+
+        from data.centerline_extraction import CenterlineExtractor
+        extractor = CenterlineExtractor()
+        endpoints = extractor._find_endpoints(self.centerline)
+
+        if endpoints:
+            idx = self.np_random.integers(len(endpoints))
+            return np.array(endpoints[idx])
+
+        idx = self.np_random.integers(len(centerline_points))
+        return centerline_points[idx]
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        self.step_count += 1
+
+        if action == 8:
+            reward = self.reward_calculator.compute_terminal_reward(
+                self.covered_centerline, self.centerline
+            )
+            return self._get_observation(), reward, True, False, self._get_info()
+
+        direction = self.DIRECTIONS[action] * self.step_size
+        new_position = self.position + direction
+
+        if not self._is_valid_position(new_position):
+            reward = self.reward_calculator.compute_out_of_bounds_penalty()
+            return self._get_observation(), reward, True, False, self._get_info()
+
+        old_position = self.position.copy()
+        self.position = new_position
+
+        y, x = self.position
+        is_revisit = self.visited_mask[y, x] > 0
+        
+        # Draw a 3x3 square on the visited mask to repel parallel tracking
+        y_min, y_max = max(0, y - 1), min(self.height, y + 2)
+        x_min, x_max = max(0, x - 1), min(self.width, x + 2)
+        self.visited_mask[y_min:y_max, x_min:x_max] = 1.0
+        
+        self.trajectory.append(tuple(self.position))
+
+        distance = self.distance_transform[self.position[0], self.position[1]]
+        is_on_track = distance <= self.tolerance
+
+        if is_on_track:
+            self.off_track_streak = 0
+        else:
+            self.off_track_streak += 1
+
+        prev_coverage = self.covered_centerline.sum()
+        self._update_coverage()
+        new_coverage = float(self.covered_centerline.sum() - prev_coverage)
+
+        # =================================================================
+        # CONTINUOUS BULLSEYE REWARD
+        # Reward exploration based on how perfectly centered the agent is
+        # =================================================================
+        if distance <= 4.0 and new_coverage > 0:
+            # Gaussian drop-off formula: e^(-(x^2) / sigma^2)
+            bullseye_multiplier = math.exp(-(distance ** 2) / 2.0)
+            new_coverage = new_coverage * bullseye_multiplier
+        # =================================================================
+
+        reward = self.reward_calculator.compute_step_reward(
+            distance=distance,
+            is_revisit=is_revisit,
+            is_on_track=is_on_track,
+            new_coverage=new_coverage,
+            prev_distance=self.distance_transform[old_position[0], old_position[1]],
+            action=action,
+            prev_action=self.prev_direction,
+        )
+
+        self.prev_direction = action
+        terminated = self.off_track_streak >= self.max_off_track
+        truncated = self.step_count >= self.max_steps
+
+        if terminated:
+            reward += self.reward_calculator.compute_off_track_termination_penalty()
+
+        return self._get_observation(), reward, terminated, truncated, self._get_info()
+
+    def _is_valid_position(self, position: np.ndarray) -> bool:
+        y, x = position
+        half = self.obs_size // 2
+        if y < half or y >= self.height - half:
+            return False
+        if x < half or x >= self.width - half:
+            return False
+        return True
+
+    def _update_coverage(self):
+        y, x = self.position
+        tol_i = int(self.tolerance)
+        
+        # Bounding box coordinates
+        y_min = max(0, y - tol_i - 1)
+        y_max = min(self.height, y + tol_i + 2)
+        x_min = max(0, x - tol_i - 1)
+        x_max = min(self.width, x + tol_i + 2)
+
+        # Slice the local regions
+        local_cl = self.centerline[y_min:y_max, x_min:x_max]
+        local_covered = self.covered_centerline[y_min:y_max, x_min:x_max]
+
+        # Create a fast coordinate grid
+        yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+        
+        # Calculate squared distances (avoids the slow np.sqrt)
+        distances_sq = (yy - y) ** 2 + (xx - x) ** 2
+        
+        # Vectorized boolean mask: within tolerance AND is a centerline pixel
+        mask = (distances_sq <= self.tolerance ** 2) & (local_cl > 0)
+        
+        # Apply the mask instantly
+        local_covered[mask] = 1.0
+
+    def _get_observation(self) -> np.ndarray:
+        return self.observation_builder.build(
+            image=self.image,
+            visited_mask=self.visited_mask,
+            position=self.position,
+            prev_direction=self.prev_direction,
+            distance_transform=self.distance_transform,
+            vessel_orientation=self.vessel_orientation,
+            dt_gradient=self.dt_gradient,               
+        )
+
+    def _get_info(self) -> Dict[str, Any]:
+        total = self.centerline.sum()
+        covered = self.covered_centerline.sum()
+        return {
+            "position": tuple(self.position),
+            "step_count": self.step_count,
+            "trajectory_length": len(self.trajectory),
+            "off_track_streak": self.off_track_streak,
+            "coverage_ratio": covered / max(total, 1),
+            "covered_pixels": int(covered),
+            "total_centerline_pixels": int(total),
+        }
+
+    def render(self) -> np.ndarray:
+        vis = (self.image.copy() * 255).astype(np.uint8)
+        vis[self.centerline > 0] = [0, 0, 255]
+        vis[self.covered_centerline > 0] = [0, 255, 0]
+        for y, x in self.trajectory:
+            vis[
+                max(0, y - 1) : min(self.height, y + 2),
+                max(0, x - 1) : min(self.width, x + 2),
+            ] = [255, 0, 0]
+        y, x = self.position
+        vis[
+            max(0, y - 2) : min(self.height, y + 3),
+            max(0, x - 2) : min(self.width, x + 3),
+        ] = [255, 255, 0]
+        return vis
+
+class VectorizedVesselEnv:
+    """Vectorized environment for parallel training."""
+
+    def __init__(self, config, num_envs=8, dataset=None):
+        self.config = config
+        self.num_envs = num_envs
+        self.dataset = dataset
+        self.envs = [VesselTracingEnv(config) for _ in range(num_envs)]
+        self.current_samples = [None] * num_envs
+
+    def reset(self):
+        observations, infos = [], []
+        for i, env in enumerate(self.envs):
+            sample = self._get_random_sample()
+            self.current_samples[i] = sample
+            env.set_data(
+                image=sample["image"].permute(1, 2, 0).numpy(),
+                centerline=sample["centerline"].squeeze().numpy(),
+                distance_transform=sample["distance_transform"].squeeze().numpy(),
+                fov_mask=sample["fov_mask"].squeeze().numpy(),
+                vessel_orientation=(sample["vessel_orientation"].numpy() if "vessel_orientation" in sample else None),
+                dt_gradient=(sample["dt_gradient"].numpy() if "dt_gradient" in sample else None),
+            )
+            obs, info = env.reset()
+            observations.append(obs)
+            infos.append(info)
+        return np.stack(observations), infos
+
+    def step(self, actions):
+        observations, rewards, terminateds, truncateds, infos = [], [], [], [], []
+        for i, (env, action) in enumerate(zip(self.envs, actions)):
+            obs, reward, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                sample = self._get_random_sample()
+                self.current_samples[i] = sample
+                env.set_data(
+                    image=sample["image"].permute(1, 2, 0).numpy(),
+                    centerline=sample["centerline"].squeeze().numpy(),
+                    distance_transform=sample["distance_transform"].squeeze().numpy(),
+                    fov_mask=sample["fov_mask"].squeeze().numpy(),
+                    vessel_orientation=(sample["vessel_orientation"].numpy() if "vessel_orientation" in sample else None),
+                    dt_gradient=(sample["dt_gradient"].numpy() if "dt_gradient" in sample else None),
                 )
-                buf[7] = orient_crop[:, :, 0]
-                buf[8] = orient_crop[:, :, 1]
+                obs, _ = env.reset()
+                info["terminal_observation"] = obs
+            observations.append(obs)
+            rewards.append(reward)
+            terminateds.append(terminated)
+            truncateds.append(truncated)
+            infos.append(info)
+        return (
+            np.stack(observations),
+            np.array(rewards),
+            np.array(terminateds),
+            np.array(truncateds),
+            infos,
+        )
 
-        # Copy out — buffer is reused across calls
-        return buf[:n].copy()
-
-    def _crop(
-        self, array: np.ndarray, y_start: int, y_end: int, x_start: int, x_end: int
-    ) -> np.ndarray:
-        """Extract a crop using fast pre-allocation"""
-        h, w = array.shape[:2]
-
-        ys = max(0, y_start)
-        ye = min(h, y_end)
-        xs = max(0, x_start)
-        xe = min(w, x_end)
-
-        # The valid region from the source array
-        valid_crop = array[ys:ye, xs:xe]
-
-        # Fast path: If the crop is fully inside the image, return it immediately
-        if y_start >= 0 and y_end <= h and x_start >= 0 and x_end <= w:
-            return valid_crop
-
-        # Padding path: Pre-allocate a blank array of the target size (much faster than np.pad)
-        target_shape = list(valid_crop.shape)
-        target_shape[0] = y_end - y_start
-        target_shape[1] = x_end - x_start
-        
-        padded = np.zeros(target_shape, dtype=array.dtype)
-        
-        # Calculate where to drop the valid crop into the padded array
-        put_y = ys - y_start
-        put_x = xs - x_start
-        padded[put_y:put_y + (ye - ys), put_x:put_x + (xe - xs)] = valid_crop
-
-        return padded
-
-    @staticmethod
-    def compute_vessel_orientation(image: np.ndarray) -> np.ndarray:
-        """Precompute vessel tangent direction from the image structure tensor.
-
-        Uses the green channel (best vessel contrast in fundus images).
-        Returns (H, W, 2) array of [tangent_y, tangent_x], normalised.
-
-        Should be called once per image (in env.set_data), not per step.
-        """
-        # Use green channel for best vessel contrast
-        if image.ndim == 3:
-            gray = image[:, :, 1].astype(np.float64)
-        else:
-            gray = image.astype(np.float64)
-
-        # Image gradients
-        iy = np.gradient(gray, axis=0)
-        ix = np.gradient(gray, axis=1)
-
-        # Structure tensor components (Gaussian-weighted local averages)
-        from scipy.ndimage import gaussian_filter
-
-        sigma = 3.0  # integration scale — ~vessel width
-        j_xx = gaussian_filter(ix * ix, sigma)
-        j_xy = gaussian_filter(ix * iy, sigma)
-        j_yy = gaussian_filter(iy * iy, sigma)
-
-        # Eigendecomposition: smallest eigenvector = vessel tangent
-        theta = 0.5 * np.arctan2(2.0 * j_xy, j_xx - j_yy + 1e-10)
-
-        # Dominant eigenvector direction (perpendicular to vessel)
-        # Rotate 90° to get vessel tangent
-        tangent_y = -np.sin(theta).astype(np.float32)  # rotated by 90°
-        tangent_x = np.cos(theta).astype(np.float32)
-
-        orientation = np.stack([tangent_y, tangent_x], axis=-1)  # (H, W, 2)
-        return orientation
+    def _get_random_sample(self):
+        idx = np.random.randint(len(self.dataset))
+        return self.dataset[idx]
