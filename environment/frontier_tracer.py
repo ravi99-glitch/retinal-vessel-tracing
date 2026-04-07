@@ -139,7 +139,7 @@ class FrontierTracer:
                     y_min, y_max = max(0, y - half_w), min(h, y + half_w + 1)
                     x_min, x_max = max(0, x - half_w), min(w, x + half_w + 1)
                     
-                    local_vessel = sample["vessel_mask"][y_min:y_max, x_min:x_max]
+                    local_vessel = sample["centerline"][y_min:y_max, x_min:x_max]
                     local_covered = combined_mask[y_min:y_max, x_min:x_max]
                     
                     untraced_y, untraced_x = np.where((local_vessel > 0) & (local_covered == 0))
