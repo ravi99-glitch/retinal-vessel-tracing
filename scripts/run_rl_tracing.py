@@ -144,8 +144,9 @@ def smooth_paths_and_redraw(paths, shape, window=7):
     for p in paths:
         if len(p) < window:
             smoothed_paths.append(p)
-            for (y, x) in p:
-                smooth_traced[int(y), int(x)] = 1.0
+            if p:
+                coords = np.array(p, dtype=np.int32)
+                smooth_traced[coords[:, 0], coords[:, 1]] = 1.0
             continue
             
         pts = np.array(p, dtype=np.float32)
@@ -297,9 +298,11 @@ def trace_e2e_mode(ppo_model, seed_model, sample, no_fov=False):
     
     h, w = sample["image"].shape[:2]
     filtered_combined = np.zeros((h, w), dtype=np.float32)
-    for p in filtered_paths:
-        for (y, x) in p:
-            filtered_combined[y, x] = 1.0
+    
+    if filtered_paths:
+        # Stack all path coordinates into a single fast numpy array
+        all_coords = np.vstack(filtered_paths).astype(np.int32)
+        filtered_combined[all_coords[:, 0], all_coords[:, 1]] = 1.0
 
     return filtered_combined, filtered_paths, merged
 
@@ -341,24 +344,32 @@ def trace_e2e_tta(ppo_model, seed_model, sample, no_fov=False):
     sample_h = create_flipped_sample(sample, 1)
     mask_h, paths_h, seeds_h = trace_e2e_mode(ppo_model, seed_model, sample_h, no_fov)
     
-    # Flip the results back
+    # Flip the results back (Horizontal)
     mask2 = mask_h[:, ::-1].copy()
-    paths2 = [[(y, w - 1 - x) for y, x in p] for p in paths_h]
-    seeds2 = [(y, w - 1 - x) for y, x in seeds_h]
+    paths2 = []
+    for p in paths_h:
+        arr = np.array(p, dtype=np.int32)
+        arr[:, 1] = w - 1 - arr[:, 1]
+        paths2.append(list(map(tuple, arr)))
+    seeds2 = list(map(tuple, np.array(seeds_h, dtype=np.int32) * [1, -1] + [0, w - 1])) if seeds_h else []
 
     # --- 3. Vertical Flip Run ---
     tqdm.write("      → [TTA 3/3] Vertical flip...")
     sample_v = create_flipped_sample(sample, 0)
     mask_v, paths_v, seeds_v = trace_e2e_mode(ppo_model, seed_model, sample_v, no_fov)
     
-    # Flip the results back
+    # Flip the results back (Vertical)
     mask3 = mask_v[::-1, :].copy()
-    paths3 = [[(h - 1 - y, x) for y, x in p] for p in paths_v]
-    seeds3 = [(h - 1 - y, x) for y, x in seeds_v]
+    paths3 = []
+    for p in paths_v:
+        arr = np.array(p, dtype=np.int32)
+        arr[:, 0] = h - 1 - arr[:, 0]
+        paths3.append(list(map(tuple, arr)))
+    seeds3 = list(map(tuple, np.array(seeds_v, dtype=np.int32) * [-1, 1] + [h - 1, 0])) if seeds_v else []
 
     # --- MAJORITY VOTE ---
     # A pixel is kept if >= 2 models agree it's a vessel
-    final_mask = ((mask1 + mask2 + mask3) >= 2.0).astype(np.float32)
+    final_mask = ((mask1 + mask2 + mask3) == 3.0).astype(np.float32)
     
     # Combine paths and seeds for the visualization overlay
     final_paths = paths1 + paths2 + paths3
@@ -506,6 +517,7 @@ def main():
     ppo_model = ActorCriticNetwork(PPO_CONFIG).to(DEVICE)
     ppo_model.load_state_dict(ppo_ckpt["model_state_dict"])
     ppo_model.eval()
+    ppo_model = torch.compile(ppo_model)
 
     seed_model = None
     if MODE == "e2e":
