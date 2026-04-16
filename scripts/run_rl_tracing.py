@@ -425,19 +425,23 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
     
     inv_mask = (sample["vessel_mask"] == 0).astype(np.uint8)
     pixel_dt = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 3)
-    # If the agent is more than 4 real pixels away from a vessel, 
-    # force the environment's internal distance to a 100.0
     sample["distance_transform"][pixel_dt > 4.0] = 100.0 
 
     all_seeds = None
     if MODE == "gt":
         traced, paths = trace_gt_mode(ppo_model, sample)
+        traced, paths = smooth_paths_and_redraw(paths, sample["image"].shape[:2], window=7)
         all_seeds = [] 
     else:
-        # Use the new TTA Wrapper!
+        # 1. Get the clean, majority-voted mask from TTA
         traced, paths, all_seeds = trace_e2e_tta(ppo_model, seed_model, sample, no_fov=no_fov)
-
-    traced, paths = smooth_paths_and_redraw(paths, sample["image"].shape[:2], window=7)
+        
+        # 2. Smooth the paths ONLY for the overlay dots, but DO NOT overwrite 'traced'!
+        _, paths = smooth_paths_and_redraw(paths, sample["image"].shape[:2], window=7)
+        
+        # 3. SKELETONIZE: Shave the thick majority mask down to a perfect 1-pixel centerline!
+        from skimage.morphology import skeletonize
+        traced = skeletonize(traced > 0).astype(np.float32)
 
     pred_skel = (traced > 0).astype(np.uint8)
     gt_skel = (sample["centerline"] > 0).astype(np.uint8)
