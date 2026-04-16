@@ -1,106 +1,84 @@
-"""PPO algorithm with GAE for retinal vessel tracing
-
-Provides:
-    RolloutBuffer   — stores transitions (including LSTM states), computes GAE
-    evaluate()      — runs n greedy episodes on val samples, returns mean F1
-    PPOTrainer      — rollout collection, PPO update, training loop, checkpointing
-
-Supports both feedforward and recurrent (LSTM) policies.
+# training/ppo.py
+"""PPO algorithm with GAE for retinal vessel tracing.
+Now featuring Vectorized Swarm Environments and Automatic Mixed Precision (AMP).
 """
 
 import os
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-try:
-    import wandb
-    _WANDB_AVAILABLE = True
-except ImportError:
-    _WANDB_AVAILABLE = False
-
 # ==========================================
-# ROLLOUT BUFFER
+# ROLLOUT BUFFER 
 # ==========================================
-
 class RolloutBuffer:
-    """Stores rollout transitions."""
+    """Stores rollout transitions for multiple environments simultaneously."""
 
-    def __init__(self):
+    def __init__(self, steps: int, num_envs: int, obs_shape: tuple):
+        self.steps = steps
+        self.num_envs = num_envs
+        self.obs_shape = obs_shape
         self.reset()
 
     def reset(self):
-        self.obs: List[np.ndarray] = []
-        self.actions: List[int] = []
-        self.log_probs: List[float] = []
-        self.rewards: List[float] = []
-        self.values: List[float] = []
-        self.dones: List[float] = []
-        self.lstm_states: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
+        self.obs = np.zeros((self.steps, self.num_envs) + self.obs_shape, dtype=np.float32)
+        self.actions = np.zeros((self.steps, self.num_envs), dtype=np.int64)
+        self.log_probs = np.zeros((self.steps, self.num_envs), dtype=np.float32)
+        self.rewards = np.zeros((self.steps, self.num_envs), dtype=np.float32)
+        self.values = np.zeros((self.steps, self.num_envs), dtype=np.float32)
+        self.dones = np.zeros((self.steps, self.num_envs), dtype=np.float32)
+        self.step = 0
 
-    def add(
-        self,
-        obs: np.ndarray,
-        action: int,
-        log_prob: float,
-        reward: float,
-        value: float,
-        done: float,
-        lstm_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ):
-        self.obs.append(obs)
-        self.actions.append(action)
-        self.log_probs.append(log_prob)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.dones.append(done)
-        if lstm_state is not None:
-            self.lstm_states.append(
-                (lstm_state[0].detach().cpu(), lstm_state[1].detach().cpu())
-            )
-        else:
-            self.lstm_states.append(None)
+    def add(self, obs, actions, log_probs, rewards, values, dones):
+        self.obs[self.step] = obs
+        self.actions[self.step] = actions
+        self.log_probs[self.step] = log_probs
+        self.rewards[self.step] = rewards
+        self.values[self.step] = values
+        self.dones[self.step] = dones
+        self.step += 1
 
     def compute_returns_and_advantages(
-        self, last_value: float, gamma: float, gae_lambda: float
+        self, last_values: np.ndarray, gamma: float, gae_lambda: float
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        n = len(self.rewards)
-        advantages = np.empty(n, dtype=np.float32)
+        advantages = np.zeros((self.steps, self.num_envs), dtype=np.float32)
+        lastgaelam = np.zeros(self.num_envs, dtype=np.float32)
 
-        rewards = np.asarray(self.rewards, dtype=np.float32)
-        values = np.asarray(self.values, dtype=np.float32)
-        dones = np.asarray(self.dones, dtype=np.float32)
+        for t in reversed(range(self.steps)):
+            if t == self.steps - 1:
+                nextnonterminal = 1.0 - self.dones[t]
+                nextvalues = last_values
+            else:
+                nextnonterminal = 1.0 - self.dones[t]
+                nextvalues = self.values[t + 1]
+            
+            delta = self.rewards[t] + gamma * nextvalues * nextnonterminal - self.values[t]
+            advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
 
-        gae = 0.0
-        next_value = last_value
-        for t in range(n - 1, -1, -1):
-            not_done = 1.0 - dones[t]
-            delta = rewards[t] + gamma * next_value * not_done - values[t]
-            gae = delta + gamma * gae_lambda * not_done * gae
-            advantages[t] = gae
-            next_value = values[t]
+        returns = advantages + self.values
 
-        advantages_t = torch.from_numpy(advantages)
-        returns = advantages_t + torch.from_numpy(values)
-        advantages_t = (advantages_t - advantages_t.mean()) / (
-            advantages_t.std() + 1e-8
-        )
-        return returns, advantages_t
+        # Flatten the batches for the GPU
+        adv_flat = torch.from_numpy(advantages.reshape(-1))
+        ret_flat = torch.from_numpy(returns.reshape(-1))
+
+        # Normalize advantages
+        adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+        
+        return ret_flat, adv_flat
 
     def get_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = torch.tensor(np.array(self.obs), dtype=torch.float32)
-        actions = torch.tensor(np.array(self.actions), dtype=torch.long)
-        log_probs = torch.tensor(np.array(self.log_probs), dtype=torch.float32)
-        return obs, actions, log_probs
+        obs_flat = torch.tensor(self.obs.reshape(-1, *self.obs_shape), dtype=torch.float32)
+        act_flat = torch.tensor(self.actions.reshape(-1), dtype=torch.long)
+        log_flat = torch.tensor(self.log_probs.reshape(-1), dtype=torch.float32)
+        return obs_flat, act_flat, log_flat
 
 # ==========================================
 # EVALUATION 
 # ==========================================
-
 def evaluate(
     model: nn.Module,
     val_samples: List[Dict],
@@ -109,7 +87,6 @@ def evaluate(
     tolerance: float,
     n_episodes: int = 1,
 ) -> Dict[str, float]:
-    """Run n greedy episodes per val sample."""
     from data.centerline_extraction import compute_centerline_f1
     from environment.vessel_env import VesselTracingEnv
 
@@ -136,17 +113,11 @@ def evaluate(
                 start = tuple(cl_points[idx])
                 obs, _ = env.reset(start_position=start)
 
-                lstm_state = model.init_hidden(batch_size=1, device=device)
                 done = False
                 while not done:
                     obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-                    # Support for both ResNet and LSTM via conditional unpacking
-                    out = model(obs_t, lstm_state)
-                    if len(out) == 3:
-                        logits, _, lstm_state = out
-                    else:
-                        logits, _ = out
-                        
+                    logits, _ = model(obs_t)
+                    
                     action = logits.argmax(dim=-1).item()
                     obs, _, terminated, truncated, info = env.step(action)
                     done = terminated or truncated
@@ -165,9 +136,7 @@ def evaluate(
         "mean_f1": float(np.mean(f1_scores)) if f1_scores else 0.0,
     }
 
-
 class RunningRewardNormalizer:
-    """Track running mean/std of rewards for normalisation."""
     def __init__(self, clip: float = 10.0, gamma: float = 0.99):
         self.clip = clip
         self.gamma = gamma
@@ -186,19 +155,17 @@ class RunningRewardNormalizer:
         std = max(np.sqrt(self.running_var), 1e-8)
         return np.clip((reward - self.running_mean) / std, -self.clip, self.clip)
 
-
 # ==========================================
-# PPO TRAINER 
+# PPO TRAINER (AMP + VECTORIZED)
 # ==========================================
-
 class PPOTrainer:
-    """PPO trainer with GAE."""
-
     def __init__(
         self,
         model: nn.Module,
         config: dict,
         device: torch.device,
+        num_envs: int = 8,
+        use_amp: bool = True,
         lr: float = 1e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -208,17 +175,21 @@ class PPOTrainer:
         max_grad_norm: float = 1.0,
         ppo_epochs: int = 4,
         mini_batch_size: int = 256,
-        steps_per_iter: int = 4096,
-        num_iterations: int = 1000,
+        steps_per_iter: int = 2048,
+        num_iterations: int = 400,
         eval_every: int = 25,
         save_every: int = 50,
         tolerance: float = 2.0,
-        lstm_chunk_length: int = 32,
-        use_wandb: bool = False,
     ):
         self.model = model
         self.config = config
         self.device = device
+        self.num_envs = num_envs
+        self.use_amp = use_amp
+        
+        # AMP Scaler for mixed precision
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_eps = clip_eps
@@ -232,8 +203,6 @@ class PPOTrainer:
         self.eval_every = eval_every
         self.save_every = save_every
         self.tolerance = tolerance
-        self.lstm_chunk_length = lstm_chunk_length
-        self.use_lstm = getattr(model, "use_lstm", False)
         self.value_clamp = config.get("training", {}).get("value_clamp", 10.0)
 
         self.reward_normalizer = RunningRewardNormalizer(
@@ -251,14 +220,9 @@ class PPOTrainer:
             total_iters=num_iterations,
         )
 
-        self.use_wandb = use_wandb and _WANDB_AVAILABLE
-        if self.use_wandb:
-            wandb.init(project="vessel-tracing", config=config, resume="allow")
-
-    def _ppo_update_ff(self, buffer: RolloutBuffer, last_value: float) -> Dict[str, float]:
-        """Standard feedforward PPO update."""
+    def _ppo_update_ff(self, buffer: RolloutBuffer, last_values: np.ndarray) -> Dict[str, float]:
         returns, advantages = buffer.compute_returns_and_advantages(
-            last_value, self.gamma, self.gae_lambda
+            last_values, self.gamma, self.gae_lambda
         )
         obs, actions, old_log_probs = buffer.get_tensors()
 
@@ -276,36 +240,41 @@ class PPOTrainer:
             for start in range(0, dataset_size, self.mini_batch_size):
                 idx = perm[start : start + self.mini_batch_size]
 
-                out = self.model(obs[idx])
-                logits = out[0]
-                values = out[1]
-                
-                dist = torch.distributions.Categorical(logits=logits)
-                log_prob = dist.log_prob(actions[idx])
-                entropy = dist.entropy().mean()
+                # AMP Forward Pass
+                with torch.autocast('cuda', enabled=self.use_amp):
+                    out = self.model(obs[idx])
+                    logits = out[0]
+                    values = out[1]
+                    
+                    dist = torch.distributions.Categorical(logits=logits)
+                    log_prob = dist.log_prob(actions[idx])
+                    entropy = dist.entropy().mean()
 
-                ratio = torch.exp(log_prob - old_log_probs[idx])
+                    ratio = torch.exp(log_prob - old_log_probs[idx])
 
-                with torch.no_grad():
-                    approx_kl = (((ratio - 1) - (log_prob - old_log_probs[idx])).mean().item())
-                    total_kl += approx_kl
+                    with torch.no_grad():
+                        approx_kl = (((ratio - 1) - (log_prob - old_log_probs[idx])).mean().item())
+                        total_kl += approx_kl
 
-                surr1 = ratio * advantages[idx]
-                surr2 = (torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages[idx])
-                p_loss = -torch.min(surr1, surr2).mean()
+                    surr1 = ratio * advantages[idx]
+                    surr2 = (torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages[idx])
+                    p_loss = -torch.min(surr1, surr2).mean()
 
-                v_loss = nn.functional.mse_loss(
-                    torch.clamp(values, -self.value_clamp, self.value_clamp),
-                    torch.clamp(returns[idx], -self.value_clamp, self.value_clamp),
-                )
+                    v_loss = nn.functional.mse_loss(
+                        torch.clamp(values, -self.value_clamp, self.value_clamp),
+                        torch.clamp(returns[idx], -self.value_clamp, self.value_clamp),
+                    )
 
-                loss = p_loss + self.value_coef * v_loss - self.entropy_coef * entropy
+                    loss = p_loss + self.value_coef * v_loss - self.entropy_coef * entropy
 
+                # AMP Backward Pass
                 self.optimizer.zero_grad()
-                loss.backward()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 total_gn += grad_norm.item()
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 total_p += p_loss.item()
                 total_v += v_loss.item()
@@ -313,7 +282,7 @@ class PPOTrainer:
                 n += 1
 
         with torch.no_grad():
-            values_all = torch.tensor(buffer.values, dtype=torch.float32)
+            values_all = torch.tensor(buffer.values.reshape(-1), dtype=torch.float32)
             ev = (1 - (returns.cpu() - values_all).var() / (returns.cpu().var() + 1e-8)).item()
 
         return {
@@ -341,7 +310,7 @@ class PPOTrainer:
         if os.path.exists(imitation_path):
             ckpt = torch.load(imitation_path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            print(f"Loaded imitation weights  val_acc={ckpt.get('val_acc', 0):.3f}")
+            print(f"Loaded imitation weights")
             for layer in self.model.value_head:
                 if isinstance(layer, nn.Linear):
                     nn.init.orthogonal_(layer.weight, gain=1.0)
@@ -360,86 +329,82 @@ class PPOTrainer:
         log_path: str,
         imitation_path: str = "",
     ) -> None:
-        from environment.vessel_env import VesselTracingEnv
+        from environment.vessel_env import VectorizedVesselEnv
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         start_iteration, best_f1 = self.load_checkpoint(save_path, imitation_path)
 
-        env = VesselTracingEnv(self.config)
-        buffer = RolloutBuffer()
+        # Create vectorized environments for parallel data collection
+        env = VectorizedVesselEnv(self.config, num_envs=self.num_envs, dataset=train_samples)
+        
+        # Calculate matrix dimensions
+        obs_shape = (9, self.config["environment"]["observation_size"], self.config["environment"]["observation_size"])
+        steps_per_env = self.steps_per_iter // self.num_envs
+        
+        buffer = RolloutBuffer(steps=steps_per_env, num_envs=self.num_envs, obs_shape=obs_shape)
+        
         episode_rewards: deque = deque(maxlen=50)
         episode_lengths: deque = deque(maxlen=50)
+        
+        ep_rewards = np.zeros(self.num_envs, dtype=np.float32)
+        ep_lengths = np.zeros(self.num_envs, dtype=np.int32)
         log_lines: List[str] = []
 
-        current = np.random.choice(train_samples)
-        env.set_data(
-            image=current["image"],
-            centerline=current["centerline"],
-            distance_transform=current["distance_transform"],
-            fov_mask=current["fov_mask"],
-        )
         obs, _ = env.reset()
-        ep_reward = 0.0
-        ep_length = 0
-        lstm_state = self.model.init_hidden(batch_size=1, device=self.device)
 
-        print(f"\nStarting PPO — iters {start_iteration}–{self.num_iterations} × {self.steps_per_iter} steps\n")
+        print(f"\nStarting Swarm PPO | {self.num_envs} Envs | AMP: {self.use_amp}")
+        print(f"Iters {start_iteration}–{self.num_iterations} × {self.steps_per_iter} steps/iter\n")
 
         for iteration in range(start_iteration, self.num_iterations + 1):
             buffer.reset()
             self.model.eval()
 
-            for _ in range(self.steps_per_iter):
-                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            for _ in range(steps_per_env):
+                obs_t = torch.tensor(obs, dtype=torch.float32).to(self.device)
+                
+                # Get actions from the network for ALL 8 environments simultaneously
                 with torch.no_grad():
-                    # Handle both ResNet and LSTM modes smoothly
-                    if hasattr(self.model, 'get_action_and_value'):
-                        out = self.model.get_action_and_value(obs_t, lstm_state)
-                        if len(out) == 5:
-                            action, log_prob, _, value, new_lstm_state = out
-                        else:
-                            action, log_prob, _, value = out
-                            new_lstm_state = None
-                    else:
-                        raise AttributeError("Model must implement get_action_and_value")
+                    with torch.autocast('cuda', enabled=self.use_amp):
+                        out = self.model.get_action_and_value(obs_t)
+                    action, log_prob, _, value = out
 
-                next_obs, reward, terminated, truncated, info = env.step(action.item())
-                done = terminated or truncated
+                actions_np = action.cpu().numpy()
+                
+                # Step the Swarm
+                next_obs, rewards, terminateds, truncateds, infos = env.step(actions_np)
+                dones = np.logical_or(terminateds, truncateds).astype(np.float32)
 
-                self.reward_normalizer.update(reward)
-                norm_reward = self.reward_normalizer.normalize(reward)
+                norm_rewards = np.zeros_like(rewards, dtype=np.float32)
+                for i in range(self.num_envs):
+                    self.reward_normalizer.update(rewards[i])
+                    norm_rewards[i] = self.reward_normalizer.normalize(rewards[i])
+                    
+                    ep_rewards[i] += rewards[i]
+                    ep_lengths[i] += 1
+                    
+                    if dones[i]:
+                        episode_rewards.append(ep_rewards[i])
+                        episode_lengths.append(ep_lengths[i])
+                        ep_rewards[i] = 0.0
+                        ep_lengths[i] = 0
 
                 buffer.add(
-                    obs, action.item(), log_prob.item(), norm_reward, value.item(), float(done), lstm_state,
+                    obs, 
+                    actions_np, 
+                    log_prob.cpu().numpy(), 
+                    norm_rewards, 
+                    value.cpu().numpy(), 
+                    dones
                 )
-
-                ep_reward += reward
-                ep_length += 1
                 obs = next_obs
-                lstm_state = new_lstm_state
 
-                if done:
-                    episode_rewards.append(ep_reward)
-                    episode_lengths.append(ep_length)
-                    ep_reward = 0.0
-                    ep_length = 0
-                    lstm_state = self.model.init_hidden(batch_size=1, device=self.device)
-
-                    current = np.random.choice(train_samples)
-                    env.set_data(
-                        image=current["image"],
-                        centerline=current["centerline"],
-                        distance_transform=current["distance_transform"],
-                        fov_mask=current["fov_mask"],
-                    )
-                    obs, _ = env.reset()
-
+            # Get the final boot-strap value
             with torch.no_grad():
-                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
-                last_value = self.model.get_value(obs_t, lstm_state).item()
+                obs_t = torch.tensor(obs, dtype=torch.float32).to(self.device)
+                with torch.autocast('cuda', enabled=self.use_amp):
+                    last_values = self.model.get_value(obs_t).cpu().numpy()
 
             self.model.train()
-            stats = self._ppo_update_ff(buffer, last_value)
-            current_lr = self.scheduler.get_last_lr()[0]
+            stats = self._ppo_update_ff(buffer, last_values)
             self.scheduler.step()
 
             mean_reward = np.mean(episode_rewards) if episode_rewards else 0.0
@@ -451,24 +416,9 @@ class PPOTrainer:
                 f"entropy={stats['entropy']:.3f}"
             )
 
-            if self.use_wandb:
-                wandb.log({
-                    "train/policy_loss": stats["policy_loss"],
-                    "train/value_loss": stats["value_loss"],
-                    "train/entropy": stats["entropy"],
-                    "train/approx_kl": stats["approx_kl"],
-                    "train/explained_variance": stats["explained_variance"],
-                    "train/mean_reward": mean_reward,
-                    "train/mean_ep_length": mean_length,
-                    "train/lr": current_lr,
-                }, step=iteration)
-
             if iteration % self.eval_every == 0 and val_samples:
                 ev = evaluate(self.model, val_samples, self.config, self.device, self.tolerance)
                 log += f"  |  val_cov={ev['mean_coverage']:.3f}  val_f1={ev['mean_f1']:.3f}"
-
-                if self.use_wandb:
-                    wandb.log({"eval/mean_f1": ev["mean_f1"], "eval/mean_coverage": ev["mean_coverage"]}, step=iteration)
 
                 if ev["mean_f1"] > best_f1:
                     best_f1 = ev["mean_f1"]
@@ -504,9 +454,6 @@ class PPOTrainer:
 
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("\n".join(log_lines))
-
-        if self.use_wandb:
-            wandb.finish()
 
         print(f"\nDone. Best F1: {best_f1:.3f}")
         print(f"Weights: {save_path}")
