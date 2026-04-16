@@ -1,8 +1,6 @@
 # scripts/train_ppo_resnet.py
 """PPO Training — Step 2 of 2. Run AFTER train_imitation.py.
-
-All PPO logic lives in rl_training/ppo.py.
-This script handles: paths, config, and data loading via the unified dataloader.
+Handles paths, config, data loading, and launching the Swarm Trainer.
 """
 
 import os
@@ -40,8 +38,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CONFIG = {
     "policy": {
         "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": False,
         "dropout": 0.05,
         "encoder_type": "resnet",
     },
@@ -49,17 +45,18 @@ CONFIG = {
         "observation_size": OBS_SIZE,
         "tolerance": TOLERANCE,
         "max_steps_per_episode": MAX_STEPS,
-        "max_off_track_streak": 8,
+        "max_off_track_streak": 5,
         "step_size": 1,
     },
     "reward": {
         "alpha_near": 0.5,
         "beta_coverage": 2.0,
         "gamma_off": -1.0,
-        "lambda_revisit": -0.5,     
+        "lambda_revisit": -5.0,     
         "step_cost": -0.01,
         "direction_bonus": 0.05,    
-        "terminal_f1_weight": 5.0,
+        "terminal_f1_weight": 2.5,
+        "terminal_cldice_weight": 5.0,
         "smoothness_penalty": -0.05,
         "use_potential_shaping": False,
     },
@@ -71,9 +68,7 @@ CONFIG = {
 # ==========================================
 
 def dataloader_to_env_samples(dataset, limit: int = None) -> List[Dict]:
-    """Convert dataloader samples (torch tensors) to env-compatible numpy dicts."""
     samples = []
-    
     n_samples = len(dataset) if limit is None else min(limit, len(dataset))
     
     for i in range(n_samples):
@@ -85,8 +80,8 @@ def dataloader_to_env_samples(dataset, limit: int = None) -> List[Dict]:
 
         inv_mask = (vessel_mask == 0).astype(np.uint8)
         pixel_dt = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 3)
-        dt[pixel_dt > 4.0] = 100.0  # Instant death if 4 pixels off-track
-        dt[fov_mask == 0] = 100.0   # Instant death if outside FOV
+        dt[pixel_dt > 4.0] = 100.0  
+        dt[fov_mask == 0] = 100.0   
         
         samples.append(
             {
@@ -100,28 +95,18 @@ def dataloader_to_env_samples(dataset, limit: int = None) -> List[Dict]:
                 "dt_gradient": s["dt_gradient"].numpy(),
             }
         )
-
     return samples
-
     
 def load_samples(split: str, limit: int = None) -> List[Dict]:
-    ds, _ = get_data(
-        "rl_agent",
-        split,
-        tolerance=TOLERANCE,
-    )
+    ds, _ = get_data("rl_agent", split, tolerance=TOLERANCE)
     samples = dataloader_to_env_samples(ds, limit=limit)
-    print(f"Loaded {len(samples)} {split} samples (combined dataset).")
-    for s in samples:
-        print(f"  [{s['id']}] centerline px: {int(s['centerline'].sum())}")
+    print(f"Loaded {len(samples)} {split} samples.")
     return samples
-
 
 # ==========================================
 # VISUALIZATION
 # ==========================================
 def plot_training_curve(log_file: str, save_file: str):
-    """Parses the PPO log file and generates a learning curve graph."""
     print(f"\nGenerating training curve graph from {log_file}...")
     if not os.path.exists(log_file):
         print(f"Log file not found: {log_file}")
@@ -153,7 +138,6 @@ def plot_training_curve(log_file: str, save_file: str):
         return
 
     fig, ax1 = plt.subplots(figsize=(10, 6))
-
     ax1.set_xlabel("PPO Iterations", fontweight='bold')
     ax1.set_ylabel("Mean Episode Reward", color="tab:blue", fontweight='bold')
     ax1.plot(iters, rewards, color="tab:blue", alpha=0.7, label="Reward")
@@ -166,18 +150,17 @@ def plot_training_curve(log_file: str, save_file: str):
         ax2.plot(val_iters, val_f1s, color="tab:red", marker="o", linewidth=2, label="Val F1")
         ax2.tick_params(axis="y", labelcolor="tab:red")
 
-    plt.title("PPO Agent Training Progress", fontsize=14, fontweight='bold')
+    plt.title("PPO Agent Training Progress (Swarm + AMP)", fontsize=14, fontweight='bold')
     fig.tight_layout()
-    
     plt.savefig(save_file, dpi=150)
     print(f"Graph successfully saved to: {save_file}")
-
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
     print(f"Device: {DEVICE}")
+    torch.set_float32_matmul_precision("high")
 
     train_samples = load_samples("train")  
     val_samples = load_samples("val")      
@@ -187,10 +170,14 @@ def main():
         return
 
     model = ActorCriticNetwork(CONFIG).to(DEVICE)
+    model = torch.compile(model)
+    
     trainer = PPOTrainer(
         model,
         CONFIG,
         DEVICE,
+        num_envs=16,        
+        use_amp=True,
         lr=1e-4,
         gamma=0.99,
         gae_lambda=0.95,
@@ -215,9 +202,7 @@ def main():
         imitation_path=IMITATION_WEIGHTS,
     )
 
-    # --- Generate the visualization after training finishes ---
     plot_training_curve(LOG_PATH, PLOT_PATH)
-
 
 if __name__ == "__main__":
     main()
