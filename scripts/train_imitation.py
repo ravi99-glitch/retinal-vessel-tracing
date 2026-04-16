@@ -40,8 +40,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CONFIG = {
     "policy": {
         "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": False,
         "dropout": 0.0,
         "encoder_type": "resnet",
     },
@@ -56,10 +54,11 @@ CONFIG = {
         "alpha_near": 0.5,           
         "beta_coverage": 1.0,
         "gamma_off": -1.0,           
-        "lambda_revisit": -0.5,      
+        "lambda_revisit": -5.0,      
         "step_cost": -0.01,
         "direction_bonus": 0.05,
-        "terminal_f1_weight": 5.0,
+        "terminal_f1_weight": 2.5,
+        "terminal_cldice_weight": 5.0,
         "smoothness_penalty": -0.05,
         "use_potential_shaping": False,
     },
