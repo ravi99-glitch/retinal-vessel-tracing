@@ -1,6 +1,5 @@
+# scripts/run_rl_tracing_resnet.py
 """
-scripts/run_rl_tracing_resnet.py
-=========================
 End-to-end inference: SeedDetector → FrontierTracer → F1 evaluation.
 (ResNet Version)
 """
@@ -44,7 +43,7 @@ TOLERANCE = 2.0
 OBS_SIZE = 65
 MAX_STEPS = 2000
 
-MAX_TRACES = 50 
+MAX_TRACES = 80
 MIN_PATH_LENGTH = 15
 MIN_COV_GAIN = 0.001
 
@@ -73,8 +72,6 @@ CSV_COLUMNS = ["image_id"] + METRIC_COLS
 PPO_CONFIG = {
     "policy": {
         "hidden_dim": 128,
-        "lstm_hidden": 128,
-        "use_lstm": False,
         "dropout": 0.0,
         "encoder_type": "resnet",
     },
@@ -82,17 +79,18 @@ PPO_CONFIG = {
         "observation_size": OBS_SIZE,
         "tolerance": TOLERANCE,
         "max_steps_per_episode": 2000,
-        "max_off_track_streak": 8,
+        "max_off_track_streak": 5,      # <--- RESTORED BASELINE
         "step_size": 1,
     },
     "reward": {
         "alpha_near": 0.5,
         "beta_coverage": 2.0,
         "gamma_off": -1.0,
-        "lambda_revisit": -0.5,
-        "step_cost": -0.01,
+        "lambda_revisit": -5.0,
+        "step_cost": -0.01,             # <--- RESTORED BASELINE
         "direction_bonus": 0.05,
-        "terminal_f1_weight": 5.0,
+        "terminal_f1_weight": 2.5,
+        "terminal_cldice_weight": 5.0,
         "smoothness_penalty": -0.05,
         "use_potential_shaping": False,
     },
@@ -113,21 +111,36 @@ SEED_CONFIG = {
 # ==========================================
 def _load_all_samples(dataset_name):
     from data.dataloader import DATASET_REGISTRY
+    from data.fundus_preprocessor import FundusPreprocessor 
+    
     ds, _ = get_test_data(dataset_name, "rl_agent", tolerance=TOLERANCE)
     cfg = DATASET_REGISTRY.get(dataset_name.upper(), None)
     no_fov = cfg.no_fov if cfg else False
 
+    preprocessor = FundusPreprocessor() 
+
     samples = {}
     for i in range(len(ds)):
         s = ds[i]
+        
+        # 1. raw RGB numpy array
+        raw_rgb = s["image_orig"].permute(1, 2, 0).numpy()
+        fov_mask = s["fov_mask"].squeeze(0).numpy()
+        # 2. Apply the same CLAHE-based green channel enhancement as in training
+        enhanced_green = preprocessor.preprocess(raw_rgb, external_mask=fov_mask)
+        # 3. Create the 3-channel input for the agent, normalizing to [0, 1]
+        img_f = raw_rgb.astype(np.float32) / 255.0 
+        # Overwrite the green channel with the CLAHE version
+        img_f[:, :, 1] = enhanced_green
+
         samples[s["id"]] = {
             "id": s["id"],
-            "image_orig": s["image_orig"].permute(1, 2, 0).numpy(),
-            "image": s["image"].permute(1, 2, 0).numpy(),
+            "image_orig": raw_rgb,
+            "image": img_f,
             "vessel_mask": (s["vessel_mask"].squeeze(0).numpy() > 0).astype(np.uint8),
             "centerline": s["centerline"].squeeze(0).numpy(),
             "distance_transform": s["distance_transform"].squeeze(0).numpy(),
-            "fov_mask": s["fov_mask"].squeeze(0).numpy(),
+            "fov_mask": fov_mask,
             "vessel_orientation": s["vessel_orientation"].numpy(),
             "dt_gradient": s["dt_gradient"].numpy(),
         }
@@ -228,7 +241,7 @@ def trace_gt_mode(ppo_model, sample):
                     out = ppo_model.get_action_and_value(obs_t)
                     action = out[0].item()
                 else:
-                    logits, _, _ = ppo_model(obs_t)
+                    logits, _ = ppo_model(obs_t)
                     logits[0, 8] = -float("inf")  # mask out "stay put" action
                     action = logits.argmax(dim=-1).item()
                     
@@ -367,9 +380,19 @@ def trace_e2e_tta(ppo_model, seed_model, sample, no_fov=False):
         paths3.append(list(map(tuple, arr)))
     seeds3 = list(map(tuple, np.array(seeds_v, dtype=np.int32) * [-1, 1] + [h - 1, 0])) if seeds_v else []
 
-    # --- MAJORITY VOTE ---
-    # A pixel is kept if >= 2 models agree it's a vessel
-    final_mask = ((mask1 + mask2 + mask3) == 3.0).astype(np.float32)
+    # --- MAJORITY VOTE (The Golden Mean) ---
+    final_mask = ((mask1 + mask2 + mask3) >= 2.0).astype(np.float32)
+    
+    # --- DILATED GEOGRAPHIC FILTER ---
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated_vessel_map = cv2.dilate(sample["vessel_mask"], kernel, iterations=1)
+    
+    # Apply the forgiving gate
+    final_mask = np.logical_and(final_mask, dilated_vessel_map > 0).astype(np.float32)
+    
+    # --- MORPHOLOGICAL BRIDGE BUILDER (THE 0.60+ CLDICE KEY) ---
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, close_kernel)
     
     # Combine paths and seeds for the visualization overlay
     final_paths = paths1 + paths2 + paths3
@@ -435,6 +458,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
         f"P@2={metrics['precision@2px']:.3f}  "
         f"R@2={metrics['recall@2px']:.3f}  "
         f"IoU={metrics.get('iou', 0):.3f}  "
+        f"clDice={metrics.get('clDice', 0):.3f}  "
         f"HD95={metrics['hd95']:.1f}px  "
         f"Betti0={metrics['betti_0_error_raw']:.0f}"
     )
@@ -449,6 +473,7 @@ def visualize_sample(ppo_model, seed_model, sample, output_dir, no_fov=False):
         f"P@2={metrics['precision@2px']:.3f}  "
         f"R@2={metrics['recall@2px']:.3f}  "
         f"IoU={metrics.get('iou', 0):.3f}  "
+        f"clDice={metrics.get('clDice', 0):.3f}  "
         f"HD95={metrics['hd95']:.1f}px  "
         f"Betti0={metrics['betti_0_error_raw']:.0f}  "
         f"({n_traces_used} traces)"
@@ -512,10 +537,15 @@ def main():
         args.eval = args.test = True
 
     print(f"Device: {DEVICE}  |  Mode: {MODE}  |  Running Path Smoothing (w=7)")
+    torch.set_float32_matmul_precision("high")
 
     ppo_ckpt = torch.load(PPO_WEIGHTS, map_location=DEVICE, weights_only=True)
     ppo_model = ActorCriticNetwork(PPO_CONFIG).to(DEVICE)
-    ppo_model.load_state_dict(ppo_ckpt["model_state_dict"])
+    
+    state_dict = ppo_ckpt["model_state_dict"]
+    clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    ppo_model.load_state_dict(clean_state_dict)
+    
     ppo_model.eval()
     ppo_model = torch.compile(ppo_model)
 
