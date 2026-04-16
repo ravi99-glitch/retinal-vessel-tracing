@@ -1,7 +1,6 @@
 # environment/frontier_tracer.py
 """Branch Coverage Manager for Retinal Vessel Tracing.
-Implements the Frontier-Based Coverage (Algorithm 2) to trace the full
-connected vascular tree.
+Implements the Frontier-Based Coverage to bridge topological gaps.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +12,7 @@ from tqdm import tqdm
 
 
 class FrontierTracer:
-    """Single source of truth for Frontier-Based Coverage (Algorithm 2)."""
+    """Single source of truth for Frontier-Based Coverage (Aggressive Topology Search)."""
 
     def __init__(self, env, policy_model, device, obs_size: int = 65):
         self.env = env
@@ -22,7 +21,7 @@ class FrontierTracer:
         self.obs_size = obs_size
         self.half = obs_size // 2
 
-        # Preallocated inference buffer — filled in-place each step, never reallocated
+        # Preallocated inference buffer
         n_channels = env.observation_space.shape[0]
         self._obs_buf = torch.zeros(
             1,
@@ -47,12 +46,12 @@ class FrontierTracer:
         with torch.no_grad():
             while not done:
                 self._obs_buf.copy_(torch.from_numpy(obs))
-                logits, _, _ = self.model(self._obs_buf)
+                logits, _ = self.model(self._obs_buf)
                 
                 # 1. Ban the "STOP" action
                 logits[0, 8] = -float("inf")
                 
-                # 2. Ban the "REVERSE" action to prevent 1-pixel oscillation loops
+                # 2. Ban the "REVERSE" action
                 if prev_action is not None:
                     reverse_action = (prev_action + 4) % 8
                     logits[0, reverse_action] = -float("inf")
@@ -74,7 +73,6 @@ class FrontierTracer:
         self._setup_env(sample)
         
         seeds_queue = list(initial_seeds)
-        
         h, w = sample["image"].shape[:2]
         combined_mask = np.zeros((h, w), dtype=np.float32)
         
@@ -82,12 +80,9 @@ class FrontierTracer:
         queued_mask = np.zeros((h, w), dtype=np.uint8)
         for sy, sx in initial_seeds:
             queued_mask[int(sy), int(sx)] = 1
-        # -----------------------------------
 
         paths = []
         tolerance = int(self.env.tolerance)
-        
-        # Use a slightly fatter brush to hide thick artery walls from the radar
         brush_size = tolerance + 1 
 
         MAX_DYNAMIC_TRACES = 2000 
@@ -112,7 +107,7 @@ class FrontierTracer:
                 self._obs_buf.copy_(torch.from_numpy(obs))
                 
                 with torch.no_grad():
-                    logits, _, _ = self.model(self._obs_buf)
+                    logits, _ = self.model(self._obs_buf)
                     logits[0, 8] = -float("inf")
                     if prev_action is not None:
                         reverse_action = (prev_action + 4) % 8
@@ -126,15 +121,15 @@ class FrontierTracer:
                 y, x = self.env.position
                 path.append((y, x))
                 
-                # --- Use the fatter brush ---
                 cv2.circle(combined_mask, (int(x), int(y)), brush_size, 1.0, -1)
 
                 # ==================================================
-                # ACTIVE BRANCH QUEUING
+                # ACTIVE BRANCH QUEUING (Aggressive Topology Search)
                 # ==================================================
-                # --- Cooldown (only check every 4 steps) ---
-                if len(path) > 5 and len(path) % 4 == 0:
-                    window = 15 
+                # --- Cooldown (check every 3 steps instead of 4) ---
+                if len(path) > 5 and len(path) % 3 == 0:
+                    # Increase window to 25 to "see" across larger gaps
+                    window = 25 
                     half_w = window // 2
                     y_min, y_max = max(0, y - half_w), min(h, y + half_w + 1)
                     x_min, x_max = max(0, x - half_w), min(w, x + half_w + 1)
@@ -153,12 +148,12 @@ class FrontierTracer:
                         
                         new_seed = (int(global_y[best_idx]), int(global_x[best_idx]))
                         
-                        # --- NEW: Check the spatial mask to ensure we haven't queued this junction ---
+                        # Queue it if it hasn't been queued yet
                         if queued_mask[new_seed[0], new_seed[1]] == 0 and combined_mask[new_seed[0], new_seed[1]] == 0:
                             seeds_queue.append(new_seed)
                             
-                            # Mark a 3px radius as "Queued" so we don't spam 10 seeds on the same branch!
-                            cv2.circle(queued_mask, (new_seed[1], new_seed[0]), 3, 1, -1)
+                            # Mark a slightly larger 4px radius as "Queued" 
+                            cv2.circle(queued_mask, (new_seed[1], new_seed[0]), 4, 1, -1)
                             pbar.total += 1 
                 # ==================================================
 
@@ -187,7 +182,6 @@ class FrontierTracer:
             )
 
             if start_pos is None:
-                tqdm.write(f"    Full coverage after {trace_idx} traces.")
                 break
 
             covered_before = combined_mask.sum()
@@ -208,15 +202,7 @@ class FrontierTracer:
             combined_mask[path_arr[off_mask, 0], path_arr[off_mask, 1]] = 0.0
 
             gain = (combined_mask.sum() - covered_before) / gt_total
-            coverage_pct = combined_mask.sum() / gt_total
-
-            tqdm.write(
-                f"    Trace {trace_idx+1:3d} from {start_pos} -> "
-                f"{len(path)} steps  gain={gain:.3f}  coverage={coverage_pct:.3f}"
-            )
-
             if trace_idx >= 3 and gain < min_coverage_gain:
-                tqdm.write(f"    Early stop: gain {gain:.4f} < {min_coverage_gain}")
                 break
 
         return combined_mask, all_paths
@@ -240,8 +226,8 @@ class FrontierTracer:
 
         uncovered_pts = np.argwhere(uncovered)
         h, w = gt_centerline.shape
-
         covered_bin = (covered > 0).astype(np.uint8)
+        
         if covered_bin.any():
             dist = cv2.distanceTransform(1 - covered_bin, cv2.DIST_L2, 5)
             scores = dist[uncovered_pts[:, 0], uncovered_pts[:, 1]]
@@ -266,9 +252,7 @@ class FrontierTracer:
 
         coords = np.array(path, dtype=np.intp)
         on_vessel = distance_transform[coords[:, 0], coords[:, 1]] <= tolerance
-
-        changes = np.diff(on_vessel.astype(np.int8))
-        split_indices = np.where(changes != 0)[0] + 1
+        split_indices = np.where(np.diff(on_vessel.astype(np.int8)) != 0)[0] + 1
         chunks = np.split(np.arange(len(path)), split_indices)
 
         segments = []
