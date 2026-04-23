@@ -10,18 +10,25 @@ Used by:
 """
 
 from typing import Dict, List, Optional
+import os
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from scipy.ndimage import gaussian_filter
+
+from models.seed_detector import build_seed_targets
+from config import SEED_CONFIG
+
 
 # ==========================================
 # GT HEATMAP GENERATION
 # ==========================================
-def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0,
-                        n_seeds: int = 150) -> np.ndarray:
+def create_seed_heatmap(
+    centerline: np.ndarray, sigma: float = 3.0, n_seeds: int = 50
+) -> np.ndarray:
     """Build ground-truth seed heatmap using coverage-based farthest-point sampling.
 
     Instead of placing blobs at every endpoint and junction (which produces
@@ -37,7 +44,7 @@ def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0,
     Returns:
         heatmap (H, W), float32, normalised to [0, 1]
     """
-    from scipy.ndimage import gaussian_filter
+
 
     points = np.argwhere(centerline > 0)
     if len(points) == 0:
@@ -74,57 +81,37 @@ def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0,
 
     return heatmap
 
-# def create_seed_heatmap(centerline: np.ndarray, sigma: float = 3.0) -> np.ndarray:
-#     """Build ground-truth seed heatmap for one image.
-#     Places a Gaussian blob (sigma=3px) at every endpoint and junction
-#     of the GT centerline skeleton.
-
-#     Args:
-#         centerline: binary centerline mask (H, W), float32
-#         sigma:      Gaussian sigma in pixels
-
-#     Returns:
-#         heatmap (H, W), float32, normalised to [0, 1]
-
-#     """
-#     from scipy.ndimage import gaussian_filter
-
-#     from data.centerline_extraction import CenterlineExtractor
-
-#     extractor = CenterlineExtractor()
-#     endpoints = extractor._find_endpoints(centerline)
-#     junctions = extractor._find_junctions(centerline)
-
-#     heatmap = np.zeros_like(centerline, dtype=np.float32)
-#     for y, x in endpoints + junctions:
-#         if 0 <= y < heatmap.shape[0] and 0 <= x < heatmap.shape[1]:
-#             heatmap[y, x] = 1.0
-
-#     heatmap = gaussian_filter(heatmap, sigma=sigma)
-#     if heatmap.max() > 0:
-#         heatmap /= heatmap.max()
-#     return heatmap
-
-
 # ==========================================
 # DATASET
 # ==========================================
 class SeedDataset(Dataset):
-    """Each item: (image_tensor, gt_heatmap_tensor, fov_mask_tensor)
-    image      : (3, H, W)  float32
-    gt_heatmap : (1, H, W)  float32
-    fov_mask   : (1, H, W)  float32
+    """Each item: (image_tensor, gt_heatmap_tensor, fov_mask_tensor, vessel_mask_tensor)
+    image        : (3, H, W)  float32
+    gt_heatmap   : (1, H, W)  float32  — build_seed_targets (endpoints+junctions+aux)
+    fov_mask     : (1, H, W)  float32
+    vessel_mask  : (1, H, W)  float32  — binary vessel segmentation (GT for vessel head)
     """
 
     def __init__(
-        self, samples: List[Dict], sigma: float = 3.0, resize: tuple = (512, 512)
+        self, samples: List[Dict], sigma: float = 3.0, resize: tuple = (512, 512),
+        aux_spacing: int = 20,
     ):
         self.items = []
         for s in samples:
-            gt_hm = create_seed_heatmap(s["centerline"], sigma=sigma, n_seeds=400)
+            # Use build_seed_targets: richer GT with endpoints + junctions +
+            # auxiliary seeds + inverse-thickness weighting, so thin-vessel seeds
+            # are upweighted and all major branch points are covered.
+            vessel_mask = s.get("vessel_mask", s["centerline"])
+            gt_hm = build_seed_targets(
+                s["centerline"], vessel_mask, sigma=sigma, aux_spacing=aux_spacing
+            )
+
             img_t = torch.from_numpy(s["image"].transpose(2, 0, 1)).float()
             hm_t = torch.from_numpy(gt_hm).unsqueeze(0).float()
             fov_t = torch.from_numpy(s["fov_mask"]).unsqueeze(0).float()
+            vessel_t = torch.from_numpy(
+                vessel_mask.astype(np.float32)
+            ).unsqueeze(0).float()
 
             if resize is not None:
                 h, w = resize
@@ -140,8 +127,11 @@ class SeedDataset(Dataset):
                 fov_t = F.interpolate(
                     fov_t.unsqueeze(0), size=(h, w), mode="nearest"
                 ).squeeze(0)
+                vessel_t = F.interpolate(
+                    vessel_t.unsqueeze(0), size=(h, w), mode="nearest"
+                ).squeeze(0)
 
-            self.items.append((img_t, hm_t, fov_t))
+            self.items.append((img_t, hm_t, fov_t, vessel_t))
 
     def __len__(self):
         return len(self.items)
@@ -204,6 +194,7 @@ class SeedDetectorTrainer:
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.sigma = sigma
+        self.aux_spacing = SEED_CONFIG.get("training", {}).get("aux_spacing", 20)
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -226,23 +217,21 @@ class SeedDetectorTrainer:
             config:        full CONFIG dict stored in checkpoint
 
         """
-        import os
+
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         train_loader = DataLoader(
-            SeedDataset(train_samples, sigma=self.sigma),
+            SeedDataset(train_samples, sigma=self.sigma, aux_spacing=self.aux_spacing),
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
-            pin_memory=True
+            num_workers=0,
         )
         val_loader = DataLoader(
-            SeedDataset(val_samples, sigma=self.sigma),
+            SeedDataset(val_samples, sigma=self.sigma, aux_spacing=self.aux_spacing),
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=4,
-            pin_memory=True
+            num_workers=0,
         )
 
         print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
@@ -282,13 +271,29 @@ class SeedDetectorTrainer:
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
-            for img_batch, hm_batch, fov_batch in loader:
+            for img_batch, hm_batch, fov_batch, vessel_batch in loader:
                 img_batch = img_batch.to(self.device)
                 hm_batch = hm_batch.to(self.device)
                 fov_batch = fov_batch.to(self.device)
+                vessel_batch = vessel_batch.to(self.device)
 
-                pred = self.model(img_batch)
-                loss = focal_loss(pred, hm_batch, mask=fov_batch)
+                endpoint_pred, vessel_pred = self.model(img_batch)
+
+                # Endpoint focal loss — FOV-masked so border noise doesn't
+                # supervise seed predictions near the image boundary.
+                ep_loss = focal_loss(endpoint_pred, hm_batch, mask=fov_batch)
+
+                # Vessel segmentation BCE — trains the vessel_prob head so that
+                # inference-time vessel gating (vmap > threshold) is meaningful.
+                # No FOV mask: vessel signal extends to the full FOV region.
+                vessel_loss = F.binary_cross_entropy(vessel_pred, vessel_batch)
+
+                # False-positive penalty: endpoint predictions outside vessel regions.
+                # Directly suppresses off-vessel seed proposals without degrading
+                # recall on true vessel pixels.
+                fp_penalty = (endpoint_pred * (1.0 - vessel_batch)).mean()
+
+                loss = ep_loss + 0.3 * vessel_loss + 0.2 * fp_penalty
 
                 if train:
                     self.optimizer.zero_grad()

@@ -2,6 +2,7 @@
 """Curriculum learning for progressive training difficulty."""
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from data.centerline_extraction import CenterlineExtractor
@@ -16,11 +17,22 @@ class CurriculumStage:
     difficulty: float
     min_success_rate: float
     min_episodes: int
-    description: str
-    smoothness_weight: float = 0.4
+    description: str = ""
+    smoothness_weight: float = 0.0
     max_off_track_streak: int = 3
     max_steps_per_episode: int = 600
     entropy_coef: float = 0.05
+    # Optional intra-stage entropy annealing. When ``entropy_coef_end`` is
+    # set and ``entropy_anneal_iters > 0``, the trainer linearly interpolates
+    # ``entropy_coef`` → ``entropy_coef_end`` over ``entropy_anneal_iters``
+    # outer PPO iterations spent inside the stage.
+    entropy_coef_end: Optional[float] = None
+    entropy_anneal_iters: int = 0
+    # Soft off-track tolerance.  When True the per-step off-track penalty
+    # ramps linearly with the streak (mild at 1, full at max_off_track)
+    # instead of a flat penalty every step.  Set False (default) to keep
+    # the original hard penalty (e.g. for the "full" curriculum stage).
+    off_track_penalty_ramp: bool = False
 
 
 class CurriculumManager:
@@ -74,8 +86,8 @@ class CurriculumManager:
             ]
 
         self.current_stage_idx = 0
-        self.stage_episodes = 0
-        self.stage_successes = 0
+        self._window_size = curriculum_config.get("advancement_window", 200)
+        self._recent_successes: deque = deque(maxlen=self._window_size)
 
     # ==================================================================
     # Public API
@@ -96,10 +108,7 @@ class CurriculumManager:
             success: Whether the episode was successful.
         """
         self.total_steps += 1
-        self.stage_episodes += 1
-
-        if success:
-            self.stage_successes += 1
+        self._recent_successes.append(1 if success else 0)
 
         # Linear warmup of difficulty
         if self.total_steps < self.warmup_steps:
@@ -114,16 +123,47 @@ class CurriculumManager:
         self._check_stage_advancement()
 
     def is_episode_successful(self, info: Dict[str, Any]) -> bool:
-        coverage = info.get("coverage_ratio", 0.0)
-        ep_len = info.get("step_count", 0)
+        """Determine whether an episode counts as a success for curriculum advancement.
+
+        Prefers the tolerance-aware centerline F1 stored in ``info["episode_f1"]``
+        (computed in VesselTracingEnv.step at episode end) because F1 jointly
+        captures precision AND recall and therefore cannot be gamed by traces that
+        merely cover a small fraction of the centerline at high local precision.
+
+        Falls back to the old coverage+precision check when episode_f1 is absent
+        (e.g. mid-episode info dicts from truncated episodes before the first eval).
+
+        Thresholds scale with stage difficulty so the bar rises progressively:
+          easy   (diff=0.3): min_f1 ≈ 0.10 + 0.15×0.3 ≈ 0.145
+          medium (diff=0.6): min_f1 ≈ 0.10 + 0.15×0.6 ≈ 0.190
+          full   (diff=1.0): min_f1 ≈ 0.10 + 0.15×1.0 ≈ 0.250
+        """
         stage = self.get_current_stage()
 
+        ep_f1 = info.get("episode_f1", None)
+        if ep_f1 is not None:
+            min_f1 = (
+                self._cfg.get("success_min_f1_base", 0.10)
+                + self._cfg.get("success_min_f1_scale", 0.15) * stage.difficulty
+            )
+            min_cov = self._cfg.get("success_min_coverage_base", 0.02) * (
+                1 + stage.difficulty
+            )
+            coverage = info.get("coverage_ratio", 0.0)
+            return float(ep_f1) >= min_f1 and coverage >= min_cov
+
+        # Fallback: old criterion for info dicts that lack episode_f1
+        ep_len = info.get("step_count", 0)
         base = self._cfg.get("success_min_steps_base", 20)
         scale = self._cfg.get("success_min_steps_scale", 30)
         min_length = base + int(stage.difficulty * scale)
-        min_coverage = 0.005 * (1 + stage.difficulty)
-
-        return ep_len >= min_length and coverage >= min_coverage
+        coverage = info.get("coverage_ratio", 0.0)
+        precision = info.get("precision", 0.0)
+        min_coverage = self._cfg.get("success_min_coverage_base", 0.02) * (
+            1 + stage.difficulty
+        )
+        min_precision = self._cfg.get("success_min_precision", 0.5)
+        return ep_len >= min_length and coverage >= min_coverage and precision >= min_precision
 
     def get_stage_overrides(self) -> Dict[str, Any]:
         """Return config overrides for the current stage.
@@ -143,6 +183,7 @@ class CurriculumManager:
             "environment": {
                 "max_off_track_streak": stage.max_off_track_streak,
                 "max_steps_per_episode": stage.max_steps_per_episode,
+                "off_track_penalty_ramp": stage.off_track_penalty_ramp,
             },
             "training": {
                 "entropy_coef": stage.entropy_coef,
@@ -222,26 +263,40 @@ class CurriculumManager:
 
         return difficulty
 
+    @property
+    def recent_success_rate(self) -> float:
+        """Rolling success rate over the current window. 0.0 if window is empty."""
+        if not self._recent_successes:
+            return 0.0
+        return sum(self._recent_successes) / len(self._recent_successes)
+
     # ==================================================================
     # Internal helpers
     # ==================================================================
 
     def _check_stage_advancement(self):
-        """Advance to the next stage if success-rate threshold is met."""
+        """Advance to the next stage if success-rate threshold is met.
+
+        ``min_episodes`` acts as a minimum observation count before judging.
+        It is capped to ``_window_size`` so it can never exceed the deque
+        capacity (which would make advancement permanently impossible).
+        """
         if self.current_stage_idx >= len(self.stages) - 1:
             return  # already at the last stage
 
         current_stage = self.stages[self.current_stage_idx]
 
-        if self.stage_episodes < current_stage.min_episodes:
-            return  # not enough episodes yet
+        # Guard: min_episodes cannot be larger than the window itself
+        min_obs = min(current_stage.min_episodes, self._window_size)
 
-        success_rate = self.stage_successes / self.stage_episodes
+        if len(self._recent_successes) < min_obs:
+            return  # not enough observations yet
+
+        success_rate = sum(self._recent_successes) / len(self._recent_successes)
 
         if success_rate >= current_stage.min_success_rate:
             self.current_stage_idx += 1
-            self.stage_episodes = 0
-            self.stage_successes = 0
+            self._recent_successes.clear()
             logging.info(
                 "Advancing to curriculum stage: %s",
                 self.stages[self.current_stage_idx].name,
