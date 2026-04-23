@@ -84,11 +84,32 @@ class FundusPreprocessor:
         C: int = 10,
         erosion_size: Optional[int] = None,
     ) -> np.ndarray:
-
-        binary = cv2.adaptiveThreshold(
-            image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block_size, -C
-        )
-
+        """Create FOV mask with robust fallback for challenging images."""
+        
+        # Ensure uint8
+        if image.dtype != np.uint8:
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        
+        # Apply slight blur to reduce noise
+        blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        
+        # Try adaptive thresholding first
+        try:
+            binary = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block_size, -C
+            )
+        except cv2.error:
+            # Fallback to Otsu if adaptive fails
+            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # If adaptive threshold produces too little/too much, fallback to Otsu
+        coverage = binary.sum() / (binary.size * 255)
+        if coverage < 0.05 or coverage > 0.95:
+            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
         kernel_size = self._get_dynamic_kernel_size(image, 5)
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
@@ -103,6 +124,22 @@ class FundusPreprocessor:
             largest = max(contours, key=cv2.contourArea)
             mask = np.zeros_like(mask)
             cv2.drawContours(mask, [largest], -1, 255, -1)
+        else:
+            # CRITICAL FALLBACK: No contours found, create circular mask
+            h, w = image.shape[:2]
+            mask = np.zeros((h, w), dtype=np.uint8)
+            center = (w // 2, h // 2)
+            radius = int(min(h, w) * 0.45)  # Conservative 90% diameter
+            cv2.circle(mask, center, radius, 255, -1)
+        
+        # Final check: if mask is still too small, replace with circular fallback
+        final_coverage = mask.sum() / (mask.size * 255)
+        if final_coverage < 0.10:  # Less than 10% of image
+            h, w = image.shape[:2]
+            mask = np.zeros((h, w), dtype=np.uint8)
+            center = (w // 2, h // 2)
+            radius = int(min(h, w) * 0.45)
+            cv2.circle(mask, center, radius, 255, -1)
 
         e_size = erosion_size if erosion_size is not None else kernel_size
         if e_size > 0:
@@ -112,6 +149,43 @@ class FundusPreprocessor:
             mask = cv2.erode(mask, erosion_kernel, iterations=1)
 
         return mask
+
+
+    # def create_fov_mask(
+    #     self,
+    #     image: np.ndarray,
+    #     block_size: int = 51,
+    #     C: int = 10,
+    #     erosion_size: Optional[int] = None,
+    # ) -> np.ndarray:
+
+    #     binary = cv2.adaptiveThreshold(
+    #         image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block_size, -C
+    #     )
+
+    #     kernel_size = self._get_dynamic_kernel_size(image, 5)
+    #     kernel = cv2.getStructuringElement(
+    #         cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    #     )
+
+    #     mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    #     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    #     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    #     if contours:
+    #         largest = max(contours, key=cv2.contourArea)
+    #         mask = np.zeros_like(mask)
+    #         cv2.drawContours(mask, [largest], -1, 255, -1)
+
+    #     e_size = erosion_size if erosion_size is not None else kernel_size
+    #     if e_size > 0:
+    #         erosion_kernel = cv2.getStructuringElement(
+    #             cv2.MORPH_ELLIPSE, (e_size * 2 + 1, e_size * 2 + 1)
+    #         )
+    #         mask = cv2.erode(mask, erosion_kernel, iterations=1)
+
+    #     return mask
 
     # --------------------------------------------------
     # EXTERNAL FOV HANDLING

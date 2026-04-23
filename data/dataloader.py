@@ -10,10 +10,10 @@ External test (used in full, no split):
 
 Supported targets
 -----------------
-unet           - (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
-frangi         - (H,W,3) raw RGB uint8 + binary annotations (numpy)
-greedy_tracer  - (H,W,3) raw RGB uint8 + binary annotations (numpy)
-rl_agent       - (3,H,W) float32 RGB + centerline, distance transform, …
+unet           – (1,H,W) CLAHE-preprocessed grayscale + skeleton GT
+frangi         – (H,W,3) raw RGB uint8 + binary annotations (numpy)
+greedy_tracer  – (H,W,3) raw RGB uint8 + binary annotations (numpy)
+rl_agent       – (3,H,W) float32 RGB + centerline, distance transform, …
 
 Usage
 -----
@@ -38,12 +38,11 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import (ConcatDataset, DataLoader, Dataset,
-                              WeightedRandomSampler)
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
 
 from .centerline_extraction import CenterlineExtractor
 from .fundus_preprocessor import FundusPreprocessor
-from environment.observation import ObservationBuilder  # FIXED typo (observations -> observation)
+from environment.observation import ObservationBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +53,84 @@ _DATA_BASE = Path(
     "/cfs/earth/scratch/icls/shared/icls-retinal-vessel-tracing/retinal-vessel-tracing/data"
 )
 
+# _slurm_job_id = os.environ.get("SLURM_JOB_ID")
+
 _PROJECT_ROOT = _DATA_BASE.parent
+# WEIGHTS_DIR = _PROJECT_ROOT / "weights" / f"run_{_slurm_job_id}"
+# OUTPUT_DIR = _PROJECT_ROOT / "results" / f"run_{_slurm_job_id}"
+
 WEIGHTS_DIR = _PROJECT_ROOT / "weights"
 OUTPUT_DIR = _PROJECT_ROOT / "results"
 
-#_PROJECT_ROOT = _DATA_BASE.parent
-#WEIGHTS_DIR = Path("/cfs/earth/scratch/nakanrav/retinal-vessel-tracing/weights")
-#OUTPUT_DIR = Path("/cfs/earth/scratch/nakanrav/retinal-vessel-tracing/results")
+MAX_SAMPLES = None
+
+# ---------------------------------------------------------------------------
+# Centerline UNet predictor — lazy singleton (used as a frozen feature
+# extractor for the RL observation channel `unet_prior`).
+# ---------------------------------------------------------------------------
+_UNET_PREDICTOR = None
+_UNET_LOAD_FAILED = False
+
+
+def _get_unet_predictor():
+    """Return a cached CenterlinePredictor or None if the checkpoint is missing.
+
+    Loaded once per process (per dataloader worker). On failure, logs a warning
+    and returns None so callers can fall back to disabling the prior channel.
+    """
+    global _UNET_PREDICTOR, _UNET_LOAD_FAILED
+    if _UNET_PREDICTOR is not None or _UNET_LOAD_FAILED:
+        return _UNET_PREDICTOR
+    try:
+        import torch as _torch
+
+        from models.unet import CenterlinePredictor
+
+        ckpt_path = WEIGHTS_DIR / "centerline_unet.pt"
+        if not ckpt_path.exists():
+            logger.warning(
+                "UNet prior requested but checkpoint missing: %s — "
+                "falling back to a zero-filled unet_prior channel "
+                "(observation shape is unchanged). Place the checkpoint at "
+                "this path to enable the real prior, or set "
+                "environment.use_unet_prior=False in config to drop the "
+                "channel entirely.",
+                ckpt_path,
+            )
+            _UNET_LOAD_FAILED = True
+            return None
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+        _UNET_PREDICTOR = CenterlinePredictor.from_checkpoint(
+            str(ckpt_path), device=device
+        )
+        logger.info("Loaded centerline UNet prior from %s (device=%s)", ckpt_path, device)
+        return _UNET_PREDICTOR
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load centerline UNet prior: %s", exc)
+        _UNET_LOAD_FAILED = True
+        return None
+
+
+def compute_unet_prior(image: np.ndarray) -> Optional[np.ndarray]:
+    """Run the frozen UNet on the (already-preprocessed) green channel.
+
+    ``image`` is the (H, W, 3) RGB float array produced by ``_fmt_rl_agent``;
+    its green channel has already been CLAHE-enhanced to match UNet training
+    inputs. Returns (H, W) float32 in [0, 1], or None if the predictor is
+    unavailable.
+    """
+    predictor = _get_unet_predictor()
+    if predictor is None:
+        return None
+    import torch as _torch
+
+    if image.ndim == 3:
+        gray = image[:, :, 1]
+    else:
+        gray = image
+    img_t = _torch.from_numpy(gray.astype(np.float32)).unsqueeze(0)  # (1, H, W)
+    prob = predictor._infer_full(img_t).numpy().astype(np.float32)
+    return prob
 
 
 def get_root(dataset_name: str) -> Path:
@@ -220,6 +290,8 @@ class RetinalFundusDataset(Dataset):
         transform=None,
         fundus_preprocessor: Optional[FundusPreprocessor] = None,
         centerline_extractor: Optional[CenterlineExtractor] = None,
+        max_samples: Optional[int] = None,
+        use_unet_prior: bool = False,
     ):
         if target not in VALID_TARGETS:
             raise ValueError(f"target must be one of {VALID_TARGETS}, got '{target}'")
@@ -238,6 +310,7 @@ class RetinalFundusDataset(Dataset):
         self.transform = transform
         self.fundus_preprocessor = fundus_preprocessor or FundusPreprocessor()
         self.cl_extractor = centerline_extractor or CenterlineExtractor()
+        self.use_unet_prior = use_unet_prior
 
         # Resolve root directory
         self.root = self._resolve_root(Path(root_dir))
@@ -246,6 +319,10 @@ class RetinalFundusDataset(Dataset):
         self.samples = self._discover_samples()
         if split is not None:
             self.samples = self._apply_split(self.samples, split, train_frac)
+
+        # Cap samples
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
 
         if not self.samples:
             raise FileNotFoundError(
@@ -260,9 +337,9 @@ class RetinalFundusDataset(Dataset):
         if cache_centerlines and self.resize is None:
             self._cache_dir = self.root / "centerlines_cache"
             self._cache_dir.mkdir(exist_ok=True)
-            
-        # --- NEW: Vessel Orientation Cache ---
-        self._vo_mem: Dict[str, np.ndarray] = {} 
+
+        self._vo_mem: Dict[str, np.ndarray] = {}
+        self._up_mem: Dict[str, np.ndarray] = {}  # UNet prior cache
 
         logger.info(
             "%s  %d samples  target=%s  split=%s",
@@ -352,7 +429,6 @@ class RetinalFundusDataset(Dataset):
             np.save(self._cache_dir / f"{sid}_cl.npy", cl)
         return cl
 
-    # --- NEW: Vessel Orientation Method ---
     def _get_vessel_orientation(self, sid: str, image: np.ndarray) -> np.ndarray:
         """Return cached vessel orientation, computing + persisting on first call."""
         if sid in self._vo_mem:
@@ -369,6 +445,24 @@ class RetinalFundusDataset(Dataset):
             np.save(self._cache_dir / f"{sid}_vessel_orientation.npy", vo)
         return vo
 
+    def _get_unet_prior(self, sid: str, image: np.ndarray) -> Optional[np.ndarray]:
+        """Return cached UNet prior, computing + persisting on first call."""
+        if sid in self._up_mem:
+            return self._up_mem[sid]
+        if self._cache_dir is not None:
+            cache_file = self._cache_dir / f"{sid}_unet_prior.npy"
+            if cache_file.exists():
+                up = np.load(cache_file)
+                self._up_mem[sid] = up
+                return up
+        up = compute_unet_prior(image)
+        if up is None:
+            return None
+        self._up_mem[sid] = up
+        if self._cache_dir is not None:
+            np.save(self._cache_dir / f"{sid}_unet_prior.npy", up)
+        return up
+
     # -- FOV mask ----------------------------------------------------------
 
     def _get_fov(self, sample: Dict, rgb: np.ndarray) -> np.ndarray:
@@ -380,7 +474,9 @@ class RetinalFundusDataset(Dataset):
         return self.fundus_preprocessor.create_fov_mask(green)
 
     # -- Resize ------------------------------------------------------------
-    def _maybe_resize(self, *arrays: np.ndarray, interp: Optional[List[int]] = None) -> Tuple[np.ndarray, ...]:
+    def _resize(
+        self, *arrays: np.ndarray, interp: Optional[List[int]] = None
+    ) -> Tuple[np.ndarray, ...]:
         if self.resize is None:
             return arrays
         target_h, target_w = self.resize
@@ -411,7 +507,7 @@ class RetinalFundusDataset(Dataset):
             else:
                 padded = np.zeros((target_h, target_w), dtype=arr.dtype)
 
-            padded[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+            padded[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
             out.append(padded)
 
         return tuple(out)
@@ -429,7 +525,7 @@ class RetinalFundusDataset(Dataset):
         fov = self._get_fov(sample, rgb)
 
         if self.resize is not None:
-            rgb, vessel, fov = self._maybe_resize(
+            rgb, vessel, fov = self._resize(
                 rgb,
                 vessel,
                 fov,
@@ -473,8 +569,8 @@ class RetinalFundusDataset(Dataset):
         cl = self._get_centerline(sid, vessel)
         return {
             "id": sid,
-            "image": rgb,                                      
-            "preprocessed": preprocessed,                     
+            "image": rgb,
+            "preprocessed": preprocessed,
             "vessel_mask": (vessel * 255).astype(np.uint8),
             "centerline": (cl * 255).astype(np.uint8),
             "fov_mask": fov,
@@ -492,18 +588,35 @@ class RetinalFundusDataset(Dataset):
         img_orig = img_f.copy()
 
         ext_mask = fov if fov.max() > 0 else None
-        enhanced_green = self.fundus_preprocessor.preprocess(rgb, external_mask=ext_mask)
+        enhanced_green = self.fundus_preprocessor.preprocess(
+            rgb, external_mask=ext_mask
+        )
         img_f[:, :, 1] = enhanced_green
+
+        # Per-channel percentile normalization for R and B channels.
+        # Green is already CLAHE-enhanced; R/B are raw [0,1] which lets the
+        # optic disc's high raw intensity dominate. Clip to [2nd, 98th]
+        # percentile within the FOV to suppress brightness outliers.
+        fov_mask_bool = fov > 0
+        for ch in [0, 2]:  # Red, Blue
+            channel = img_f[:, :, ch]
+            roi = channel[fov_mask_bool] if fov_mask_bool.any() else channel.ravel()
+            if roi.size > 0:
+                vmin, vmax = np.percentile(roi, [2.0, 98.0])
+                channel = np.clip(
+                    (channel - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0
+                )
+            img_f[:, :, ch] = channel
 
         cl = self._get_centerline(sid, vessel)
         dt = self.cl_extractor.compute_distance_transform(cl, self.tolerance)
         fov_f = (fov > 0).astype(np.float32)
 
-        # --- ADDED FOR THE 10-CHANNEL COMPASS ---
+        # Precompute per-image arrays (vessel_orientation is disk-cached)
         vessel_orientation = self._get_vessel_orientation(sid, img_f)
         dt_gradient = ObservationBuilder.compute_dt_gradient(dt)
 
-        return {
+        out = {
             "id": sid,
             "image": torch.from_numpy(img_f).permute(2, 0, 1).float(),
             "image_orig": torch.from_numpy(img_orig).permute(2, 0, 1).float(),
@@ -514,6 +627,11 @@ class RetinalFundusDataset(Dataset):
             "vessel_orientation": torch.from_numpy(vessel_orientation).float(),
             "dt_gradient": torch.from_numpy(dt_gradient).float(),
         }
+        if self.use_unet_prior:
+            up = self._get_unet_prior(sid, img_f)
+            if up is not None:
+                out["unet_prior"] = torch.from_numpy(up).unsqueeze(0).float()
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +645,7 @@ def get_data(
     resize: Tuple[int, int] = (512, 512),
     train_frac: float = 0.8,
     balance: bool = True,
+    max_samples_per_dataset: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[ConcatDataset, DataLoader]:
     """Load the combined train/val set (DRIVE + STARE + CHASE_DB1 + HRF + LES_AV).
@@ -573,6 +692,7 @@ def get_data(
                 resize=resize,
                 fundus_preprocessor=shared_pre,
                 centerline_extractor=shared_ext,
+                max_samples=max_samples_per_dataset,
                 **kwargs,
             )
             sub_datasets.append(ds)
@@ -622,6 +742,7 @@ def get_test_data(
     batch_size: int = 1,
     num_workers: int = 0,
     resize: Optional[Tuple[int, int]] = (512, 512),
+    max_samples: Optional[int] = MAX_SAMPLES,
     **kwargs,
 ) -> Tuple[RetinalFundusDataset, DataLoader]:
     """Load an external test dataset in full (no split).
@@ -647,6 +768,7 @@ def get_test_data(
         target=target,
         split=None,
         resize=resize,
+        max_samples=max_samples,
         **kwargs,
     )
     collate_fn = _list_collate if target in ("frangi", "greedy_tracer") else None
