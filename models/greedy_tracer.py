@@ -1,4 +1,4 @@
-# greedy_tracer.py
+# greedy_tracer_baseline.py
 """==================
 Greedy Tracer Baseline for Vessel Extraction
 
@@ -8,6 +8,7 @@ Workflow:
   3. FOV erosion (3 iterations) to eliminate boundary halo artifacts.
   4. Greedy steepest-ascent tracing from local maxima seeds.
   5. Post-trace object removal for noise cleanup.
+  6. SKAN Pruning : Graph-based removal of spurious tips.
 ==================
 """
 
@@ -15,6 +16,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import binary_erosion, gaussian_filter
+from skan import Skeleton as SkanSkeleton
+from skan import summarize
 from skimage import filters
 from skimage.morphology import remove_small_objects, skeletonize
 
@@ -155,11 +158,34 @@ class GreedyTracer:
                 traces.append(path)
 
         if self.thin_output and skeleton.any():
-            skeleton_bool = skeletonize(skeleton.astype(bool))
-            if skeleton_bool.any():
-                skeleton = (skeleton_bool * 255).astype(np.uint8)
+            skeleton_bool = skeletonize(skeleton > 0)
+
+            # --- SKAN Pruning Step ---
+            try:
+                skel = SkanSkeleton(skeleton_bool)
+                stats = summarize(skel, separator="_")
+
+                # Find short Type 1 (tip-to-junction) branches
+                short_tips = stats[
+                    (stats["branch-type"] == 1)
+                    & (stats["branch-distance"] < self.min_length)
+                ]
+
+                pruned = skeleton_bool.copy()
+                for edge_idx in short_tips.index:
+                    coords = skel.path_coordinates(edge_idx)
+                    for r, c in coords.astype(int):
+                        pruned[r, c] = False
+
+                # Re-skeletonize to ensure perfect 1-pixel junctions
+                skeleton_bool = skeletonize(pruned)
+            except Exception:
+                pass  # Fallback if graph is too small
+
+            skeleton = (skeleton_bool * 255).astype(np.uint8)
 
         return skeleton, traces
+
 
 # ==========================================
 # GREEDY TRACER BASELINE
@@ -242,7 +268,6 @@ class GreedyTracerBaseline:
 
         return vesselness.astype(np.float32)
 
-
     # Change extract_centerline signature:
     def extract_centerline(
         self,
@@ -251,17 +276,20 @@ class GreedyTracerBaseline:
         return_vesselness: bool = False,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
         """Args:
-            preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
-            fov_mask          : (H, W) uint8 FOV mask {0, 255}
+        preprocessed      : (H, W) float32 CLAHE-enhanced [0, 1]
+        fov_mask          : (H, W) uint8 FOV mask {0, 255}
         """
-        mask = fov_mask if fov_mask is not None else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
+        mask = (
+            fov_mask
+            if fov_mask is not None
+            else np.ones(preprocessed.shape[:2], dtype=np.uint8) * 255
+        )
         vesselness = self._compute_vesselness(preprocessed, mask)
         skeleton, traces = self.tracer.trace(vesselness, fov_mask=mask)
 
         if skeleton.any() and self.min_obj_size > 0:
-            skeleton_bool = remove_small_objects(skeleton > 0, 
-            min_size=self.min_obj_size,
-            connectivity=2
+            skeleton_bool = remove_small_objects(
+                skeleton > 0, min_size=self.min_obj_size
             )
             skeleton = (skeleton_bool * 255).astype(np.uint8)
 
