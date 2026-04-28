@@ -228,6 +228,98 @@ class SeedDetectorTrainer:
 
         return total_loss / len(loader)
 
+    def visualize_performance(self, val_loader: DataLoader, epoch: int, save_dir: str = "training_seed_detector"):
+        """
+        Evaluates the seed detector on the validation set.
+        Calculates TP, FP, FN using local maxima and distance matching.
+        Saves a visual debug image for the first batch of every epoch.
+        """
+        self.model.eval()
+        os.makedirs(save_dir, exist_ok=True)
+        
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        
+        saved_image = False
+
+        with torch.no_grad():
+            for batch_idx, (img, hm, fov, vessel) in enumerate(val_loader):
+                img = img.to(self.device)
+                ep_pred, _ = self.model(img)
+                
+                # Move to CPU for numpy peak extraction
+                preds = ep_pred.cpu().numpy()
+                gts = hm.cpu().numpy()
+                imgs = img.cpu().numpy()
+                
+                for i in range(preds.shape[0]):
+                    # Extract coordinates of local maxima
+                    pred_pts = peak_local_max(preds[i, 0], min_distance=10, threshold_abs=0.1)
+                    gt_pts = peak_local_max(gts[i, 0], min_distance=10, threshold_abs=0.1)
+                    
+                    if len(gt_pts) == 0:
+                        total_fp += len(pred_pts)
+                        continue
+                    if len(pred_pts) == 0:
+                        total_fn += len(gt_pts)
+                        continue
+                        
+                    # Match predictions to GTs using distance matrix
+                    dists = cdist(pred_pts, gt_pts)
+                    matched_gt = set()
+                    tp = 0
+                    
+                    # Greedy matching within a 15-pixel radius
+                    for p_idx in range(len(pred_pts)):
+                        closest_gt = np.argmin(dists[p_idx])
+                        if dists[p_idx, closest_gt] < 15 and closest_gt not in matched_gt:
+                            tp += 1
+                            matched_gt.add(closest_gt)
+                            
+                    fp = len(pred_pts) - tp
+                    fn = len(gt_pts) - tp
+                    
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+
+                    # Save a debug visualization for the very first image of the epoch
+                    if not saved_image:
+                        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                        
+                        # RGB Image
+                        axes[0].imshow(imgs[i].transpose(1, 2, 0))
+                        axes[0].set_title("Input RGB")
+                        
+                        # Ground Truth Heatmap + Peaks
+                        axes[1].imshow(gts[i, 0], cmap="magma")
+                        if len(gt_pts) > 0:
+                            axes[1].scatter(gt_pts[:, 1], gt_pts[:, 0], c='lime', s=10, marker='x')
+                        axes[1].set_title(f"GT Heatmap ({len(gt_pts)} seeds)")
+                        
+                        # Predicted Heatmap + Peaks
+                        axes[2].imshow(preds[i, 0], cmap="magma")
+                        if len(pred_pts) > 0:
+                            axes[2].scatter(pred_pts[:, 1], pred_pts[:, 0], c='cyan', s=10, marker='x')
+                        axes[2].set_title(f"Pred Heatmap ({len(pred_pts)} seeds)")
+                        
+                        for ax in axes: ax.axis('off')
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(save_dir, f"epoch_{epoch:03d}_val_sample.png"), dpi=150)
+                        plt.close()
+                        saved_image = True
+
+        # Calculate metrics and print to console
+        precision = total_tp / max(total_tp + total_fp, 1)
+        recall = total_tp / max(total_tp + total_fn, 1)
+        f1 = 2 * (precision * recall) / max(precision + recall, 1e-8)
+        
+        print(f"   -> [Validation] TP: {total_tp:4d} | FP: {total_fp:4d} | FN: {total_fn:4d} | Precision: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f}", flush=True)
+
+        self.model.train()
+        return total_tp, total_fp, total_fn
+
 
     def _plot_training_summary(self, history, save_dir="training_seed_detector"):
         """Plots a two-panel summary: TP/FP/FN Metrics and Loss Curves."""
