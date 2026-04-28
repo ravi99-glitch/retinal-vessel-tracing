@@ -49,7 +49,6 @@ def load_samples(split: str) -> List[Dict]:
         "rl_agent",
         split,
         tolerance=TOLERANCE,
-        max_samples_per_dataset=None,
     )
 
     extractor = CenterlineExtractor()
@@ -58,22 +57,20 @@ def load_samples(split: str) -> List[Dict]:
     for i in range(len(ds)):
         s = ds[i]
         sid = s["id"]
-        print(f"  [{s['id']}] image shape: {s['image'].shape}")
         centerline = s["centerline"].squeeze(0).numpy()
 
         sample = {
             "id": sid,
-            "image": s["image"].permute(1, 2, 0).numpy(),  # (3,H,W) → (H,W,3)
+            "image": s["image"].permute(1, 2, 0).numpy(),
             "centerline": centerline,
             "fov_mask": s["fov_mask"].squeeze(0).numpy(),
         }
         samples.append(sample)
+        
+        # We removed the individual sample prints from here 
+        # to keep the log clean.
 
-        n_ep = len(extractor._find_endpoints(centerline))
-        n_jn = len(extractor._find_junctions(centerline))
-        print(f"  [{sid}]  endpoints={n_ep}  junctions={n_jn}  seeds={n_ep + n_jn}")
-
-    print(f"Loaded {len(samples)} {split} samples (combined dataset).\n")
+    print(f"Loaded {len(samples)} {split} samples (combined dataset).", flush=True)
     return samples
 
 
